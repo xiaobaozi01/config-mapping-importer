@@ -1,0 +1,956 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Juniper vJunos 配置导入 · 当前代码流转</title>
+<style>
+  :root {
+    --bg: #08111f;
+    --bg-2: #0d1a2d;
+    --panel: rgba(15, 30, 50, .86);
+    --panel-2: rgba(20, 39, 64, .72);
+    --line: #244568;
+    --line-soft: rgba(83, 128, 173, .26);
+    --text: #e7f0fb;
+    --muted: #9bb0c9;
+    --faint: #6f86a2;
+    --sky: #5cc8ff;
+    --cyan: #41e3d1;
+    --green: #5ee39a;
+    --amber: #ffca6a;
+    --red: #ff7d90;
+    --violet: #b79cff;
+    --shadow: 0 18px 50px rgba(0, 0, 0, .35);
+  }
+
+  * { box-sizing: border-box; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    margin: 0;
+    color: var(--text);
+    background:
+      radial-gradient(1200px 700px at 12% -10%, rgba(64, 170, 255, .20), transparent 55%),
+      radial-gradient(900px 600px at 110% 10%, rgba(94, 227, 154, .12), transparent 50%),
+      linear-gradient(180deg, #08111f 0%, #0a1525 45%, #08111f 100%);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    line-height: 1.55;
+    min-height: 100vh;
+  }
+
+  .grid-overlay {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background-image:
+      linear-gradient(rgba(92, 200, 255, .035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(92, 200, 255, .035) 1px, transparent 1px);
+    background-size: 42px 42px;
+    mask-image: linear-gradient(180deg, rgba(0,0,0,.55), transparent 80%);
+  }
+
+  .wrap {
+    position: relative;
+    width: min(1180px, calc(100% - 40px));
+    margin: 0 auto;
+    padding: 54px 0 44px;
+  }
+
+  .hero {
+    position: relative;
+    padding: 34px 34px 30px;
+    border: 1px solid var(--line);
+    border-radius: 24px;
+    background:
+      linear-gradient(135deg, rgba(92, 200, 255, .10), transparent 48%),
+      linear-gradient(315deg, rgba(94, 227, 154, .07), transparent 45%),
+      var(--panel);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+
+  .hero::after {
+    content: "";
+    position: absolute;
+    width: 420px;
+    height: 420px;
+    right: -160px;
+    top: -220px;
+    border-radius: 50%;
+    border: 1px solid rgba(92, 200, 255, .20);
+    box-shadow: 0 0 0 42px rgba(92, 200, 255, .035), 0 0 0 84px rgba(92, 200, 255, .02);
+  }
+
+  .eyebrow {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 11px;
+    border: 1px solid rgba(92, 200, 255, .32);
+    border-radius: 999px;
+    color: var(--sky);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    background: rgba(92, 200, 255, .07);
+  }
+
+  .eyebrow::before {
+    content: "";
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--sky);
+    box-shadow: 0 0 12px var(--sky);
+  }
+
+  h1 {
+    margin: 18px 0 10px;
+    font-size: clamp(30px, 5vw, 52px);
+    line-height: 1.08;
+    letter-spacing: -.03em;
+    font-weight: 800;
+  }
+
+  h1 .accent { color: var(--sky); }
+
+  .hero p {
+    max-width: 820px;
+    margin: 0;
+    color: var(--muted);
+    font-size: 16px;
+  }
+
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 9px;
+    margin-top: 22px;
+  }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 11px;
+    border: 1px solid var(--line-soft);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, .025);
+    color: var(--muted);
+    font-size: 12.5px;
+    font-weight: 600;
+  }
+
+  .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--cyan);
+    box-shadow: 0 0 10px currentColor;
+  }
+
+  .toc {
+    position: sticky;
+    top: 12px;
+    z-index: 5;
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin: 18px 0 22px;
+    padding: 8px;
+    border: 1px solid var(--line-soft);
+    border-radius: 14px;
+    background: rgba(8, 17, 31, .82);
+    backdrop-filter: blur(14px);
+  }
+
+  .toc a {
+    color: var(--muted);
+    text-decoration: none;
+    padding: 8px 11px;
+    border-radius: 9px;
+    font-size: 13px;
+    font-weight: 650;
+  }
+
+  .toc a:hover {
+    color: var(--text);
+    background: rgba(92, 200, 255, .10);
+  }
+
+  .panel {
+    margin: 20px 0;
+    padding: 24px;
+    border: 1px solid var(--line);
+    border-radius: 20px;
+    background: var(--panel);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, .22);
+  }
+
+  .panel h2 {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin: 0 0 6px;
+    font-size: 21px;
+    letter-spacing: -.015em;
+  }
+
+  .panel h2 .num {
+    color: var(--sky);
+    font-size: 12px;
+    letter-spacing: .14em;
+    font-weight: 800;
+    text-transform: uppercase;
+  }
+
+  .sub {
+    margin: 0 0 20px;
+    color: var(--muted);
+    font-size: 14px;
+  }
+
+  .flow {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0;
+  }
+
+  .node {
+    position: relative;
+    padding: 14px 16px 14px 18px;
+    border: 1px solid var(--line-soft);
+    border-left: 3px solid var(--sky);
+    border-radius: 12px;
+    background: linear-gradient(180deg, rgba(255,255,255,.035), rgba(255,255,255,.015));
+  }
+
+  .node h3 {
+    margin: 0 0 3px;
+    font-size: 15px;
+    font-weight: 750;
+    letter-spacing: -.01em;
+  }
+
+  .node p {
+    margin: 0;
+    color: var(--muted);
+    font-size: 13px;
+  }
+
+  .node .tag {
+    display: inline-block;
+    margin-bottom: 7px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    color: var(--sky);
+    background: rgba(92, 200, 255, .10);
+    font-size: 10.5px;
+    font-weight: 800;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+
+  .node.console { border-left-color: var(--cyan); }
+  .node.console .tag { color: var(--cyan); background: rgba(65, 227, 209, .10); }
+  .node.ftp { border-left-color: var(--amber); }
+  .node.ftp .tag { color: var(--amber); background: rgba(255, 202, 106, .10); }
+  .node.commit { border-left-color: var(--violet); }
+  .node.commit .tag { color: var(--violet); background: rgba(183, 156, 255, .10); }
+  .node.clean { border-left-color: var(--green); }
+  .node.clean .tag { color: var(--green); background: rgba(94, 227, 154, .10); }
+  .node.warn { border-left-color: var(--red); }
+  .node.warn .tag { color: var(--red); background: rgba(255, 125, 144, .10); }
+
+  .arrow {
+    align-self: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1px;
+    height: 30px;
+    color: var(--faint);
+    font-size: 10px;
+    line-height: 1;
+  }
+
+  .arrow::before {
+    content: "";
+    width: 1px;
+    flex: 1;
+    background: linear-gradient(180deg, transparent, var(--line));
+  }
+
+  .arrow::after {
+    content: "▼";
+    color: var(--faint);
+    font-size: 9px;
+  }
+
+  .group {
+    padding: 12px;
+    border: 1px dashed rgba(255, 202, 106, .28);
+    border-radius: 14px;
+    background: rgba(255, 202, 106, .035);
+  }
+
+  .group .group-label {
+    margin: 0 0 9px;
+    color: var(--amber);
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: .10em;
+    text-transform: uppercase;
+  }
+
+  .group .mini-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .mini {
+    padding: 10px 11px;
+    border: 1px solid var(--line-soft);
+    border-radius: 9px;
+    background: rgba(255, 255, 255, .025);
+  }
+
+  .mini b { display: block; font-size: 12.5px; }
+  .mini span { display: block; margin-top: 2px; color: var(--faint); font-size: 11.5px; }
+
+  .prep-list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .prep-item {
+    padding: 9px 11px;
+    border: 1px solid var(--line-soft);
+    border-radius: 9px;
+    background: rgba(92, 200, 255, .035);
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .prep-item code, code.inline {
+    color: var(--sky);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .94em;
+  }
+
+  .two-col {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+  }
+
+  .card {
+    padding: 16px;
+    border: 1px solid var(--line-soft);
+    border-radius: 14px;
+    background: var(--panel-2);
+  }
+
+  .card h3 {
+    margin: 0 0 10px;
+    font-size: 15px;
+  }
+
+  .steps {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: grid;
+    gap: 7px;
+  }
+
+  .steps li {
+    display: grid;
+    grid-template-columns: 22px 1fr;
+    gap: 8px;
+    align-items: start;
+    color: var(--muted);
+    font-size: 13px;
+  }
+
+  .steps .n {
+    display: grid;
+    place-items: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 7px;
+    color: var(--sky);
+    background: rgba(92, 200, 255, .10);
+    font-size: 10px;
+    font-weight: 800;
+  }
+
+  .state-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+  }
+
+  .state {
+    padding: 5px 9px;
+    border: 1px solid rgba(65, 227, 209, .24);
+    border-radius: 8px;
+    color: var(--cyan);
+    background: rgba(65, 227, 209, .06);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+  }
+
+  .state-arrow { color: var(--faint); font-size: 11px; }
+
+  .callout {
+    margin-top: 14px;
+    padding: 12px 14px;
+    border: 1px solid rgba(255, 202, 106, .25);
+    border-left: 3px solid var(--amber);
+    border-radius: 10px;
+    background: rgba(255, 202, 106, .05);
+    color: var(--muted);
+    font-size: 12.5px;
+  }
+
+  .callout b { color: var(--amber); }
+
+  .pipeline {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .pipe {
+    flex: 1 1 150px;
+    padding: 12px;
+    border: 1px solid var(--line-soft);
+    border-radius: 11px;
+    background: rgba(255, 255, 255, .025);
+  }
+
+  .pipe b { display: block; font-size: 12.5px; }
+  .pipe span { display: block; margin-top: 3px; color: var(--faint); font-size: 11.5px; }
+
+  .pipe-arrow {
+    align-self: center;
+    color: var(--faint);
+    font-size: 15px;
+    padding: 0 2px;
+  }
+
+  .consumer-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 9px;
+    margin-top: 12px;
+  }
+
+  .consumer {
+    padding: 11px 12px;
+    border: 1px solid var(--line-soft);
+    border-radius: 10px;
+    background: rgba(92, 200, 255, .035);
+  }
+
+  .consumer b { display: block; color: var(--sky); font-size: 12px; }
+  .consumer span { display: block; margin-top: 3px; color: var(--muted); font-size: 11.5px; }
+
+  .commit-tree {
+    display: grid;
+    gap: 10px;
+  }
+
+  .commit-branches {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 9px;
+  }
+
+  .branch {
+    padding: 12px;
+    border: 1px solid var(--line-soft);
+    border-radius: 11px;
+    background: rgba(183, 156, 255, .035);
+  }
+
+  .branch b { display: block; font-size: 12.5px; color: var(--violet); }
+  .branch p { margin: 5px 0 0; color: var(--muted); font-size: 11.5px; }
+
+  .branch .result {
+    display: inline-block;
+    margin-top: 8px;
+    padding: 3px 7px;
+    border-radius: 6px;
+    color: var(--green);
+    background: rgba(94, 227, 154, .08);
+    font-size: 10.5px;
+    font-weight: 750;
+  }
+
+  .branch .result.bad { color: var(--red); background: rgba(255, 125, 144, .08); }
+  .branch .result.warn { color: var(--amber); background: rgba(255, 202, 106, .08); }
+
+  .seq {
+    display: grid;
+    gap: 0;
+    overflow: hidden;
+    border: 1px solid var(--line-soft);
+    border-radius: 14px;
+  }
+
+  .seq-row {
+    display: grid;
+    grid-template-columns: 46px 112px 26px 112px minmax(0, 1fr);
+    gap: 8px;
+    align-items: center;
+    padding: 10px 12px;
+    border-top: 1px solid rgba(83, 128, 173, .14);
+    font-size: 12.5px;
+  }
+
+  .seq-row:first-child { border-top: 0; background: rgba(92, 200, 255, .05); }
+
+  .seq-row:nth-child(even) { background: rgba(255, 255, 255, .012); }
+
+  .seq-step { color: var(--faint); font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; }
+  .actor {
+    justify-self: start;
+    padding: 4px 7px;
+    border: 1px solid var(--line-soft);
+    border-radius: 7px;
+    color: var(--text);
+    background: rgba(255, 255, 255, .025);
+    font-size: 11px;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+
+  .actor.manager { color: var(--sky); border-color: rgba(92, 200, 255, .25); }
+  .actor.console { color: var(--cyan); border-color: rgba(65, 227, 209, .25); }
+  .actor.device { color: var(--amber); border-color: rgba(255, 202, 106, .25); }
+  .actor.ftp { color: var(--violet); border-color: rgba(183, 156, 255, .25); }
+
+  .seq-arrow { color: var(--faint); text-align: center; font-size: 13px; }
+  .seq-msg { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; }
+
+  .footer {
+    margin-top: 18px;
+    padding: 16px 4px;
+    color: var(--faint);
+    font-size: 12px;
+    text-align: center;
+  }
+
+  .footer code { color: var(--muted); }
+
+  @media (max-width: 900px) {
+    .two-col, .consumer-grid, .commit-branches { grid-template-columns: 1fr 1fr; }
+    .group .mini-grid { grid-template-columns: 1fr; }
+    .seq-row { grid-template-columns: 38px 96px 20px 96px minmax(0, 1fr); }
+  }
+
+  @media (max-width: 620px) {
+    .wrap { width: min(100% - 24px, 1180px); padding-top: 24px; }
+    .hero { padding: 24px 20px; }
+    .panel { padding: 18px; }
+    .two-col, .consumer-grid, .commit-branches, .prep-list { grid-template-columns: 1fr; }
+    .seq-row { grid-template-columns: 1fr; gap: 4px; padding: 10px; }
+    .seq-arrow { display: none; }
+    .seq-msg { padding-left: 2px; }
+  }
+
+  @media print {
+    body { background: #fff; color: #111; }
+    .grid-overlay, .toc { display: none; }
+    .hero, .panel { break-inside: avoid; box-shadow: none; }
+  }
+</style>
+</head>
+<body>
+<div class="grid-overlay"></div>
+
+<div class="wrap">
+  <header class="hero">
+    <div class="eyebrow">Current Code Flow</div>
+    <h1>Juniper vJunos<br><span class="accent">配置导入代码流转</span></h1>
+    <p>
+      从 <code class="inline">import_cfg()</code> 入口，到启动登录、FTP 准备、配置加载、
+      commit 核实和清理。图中反映当前代码，不包含历史方案。
+    </p>
+    <div class="chips">
+      <span class="chip"><i class="dot"></i>统一 1800s 总预算</span>
+      <span class="chip"><i class="dot"></i>login + 空行探测</span>
+      <span class="chip"><i class="dot"></i>commit 历史为最终判据</span>
+      <span class="chip"><i class="dot"></i>锁冲突 3 次短重试</span>
+      <span class="chip"><i class="dot"></i>只删第一条 echo</span>
+    </div>
+  </header>
+
+  <nav class="toc">
+    <a href="#orchestration">01 总编排</a>
+    <a href="#boot">02 启动与登录</a>
+    <a href="#exchange">03 命令交换与文本定位</a>
+    <a href="#commit">04 Commit 状态机</a>
+    <a href="#sequence">05 时序</a>
+  </nav>
+
+  <main>
+    <section class="panel" id="orchestration">
+      <h2><span class="num">01</span>总编排：import_cfg</h2>
+      <p class="sub">
+        一个总 deadline 贯穿全流程；每一步拿剩余预算，不再按命令设置 30/60/120 秒。
+      </p>
+
+      <div class="flow">
+        <div class="node">
+          <span class="tag">入口</span>
+          <h3>import_cfg(local_cfg_path)</h3>
+          <p>创建 deadline = now + OPERATION_TIMEOUT（默认 1800s）。finally 中统一 cleanup。</p>
+        </div>
+        <div class="arrow"></div>
+
+        <div class="node console">
+          <span class="tag">连接</span>
+          <h3>init_telnet_client()</h3>
+          <p>通过父类取得 TelnetClient，并用剩余预算包住连接过程。</p>
+        </div>
+        <div class="arrow"></div>
+
+        <div class="node console">
+          <span class="tag">启动</span>
+          <h3>ConsoleSession.wait_for_boot()</h3>
+          <p>只认 login 提示符；出现候选后发送空行，必须收到探测后的新 login 才返回。</p>
+        </div>
+        <div class="arrow"></div>
+
+        <div class="node console">
+          <span class="tag">登录</span>
+          <h3>enter_command_prompt()</h3>
+          <p>login → password → shell → cli → configure → config；按 profile 数据驱动。</p>
+        </div>
+        <div class="arrow"></div>
+
+        <div class="node ftp">
+          <span class="tag">父类能力</span>
+          <h3>FTP 准备</h3>
+          <p>直接调用父类：创建临时 FTP 节点、上传 cfg、连接倒数第二个适配器。</p>
+          <div class="group" style="margin-top:11px;">
+            <p class="group-label">Parent Methods</p>
+            <div class="mini-grid">
+              <div class="mini"><b>init_ftp_server()</b><span>创建临时节点</span></div>
+              <div class="mini"><b>copy_file_to_ftp_server()</b><span>上传本地 cfg</span></div>
+              <div class="mini"><b>link_ftp_server()</b><span>连接数据口</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="arrow"></div>
+
+        <div class="node">
+          <span class="tag">Prep · Best Effort</span>
+          <h3>_prepare_config(session, deadline)</h3>
+          <p>失败只告警并继续，不阻断最终 load。</p>
+          <div class="prep-list">
+            <div class="prep-item"><code>top</code></div>
+            <div class="prep-item"><code>delete chassis auto-image-upgrade</code></div>
+            <div class="prep-item"><code>set chassis fpc 0 pic 0 number-of-ports N</code></div>
+            <div class="prep-item"><code>set interfaces &lt;if&gt; ... address 10.0.0.2/24</code></div>
+          </div>
+          <p style="margin-top:10px;">需要变更的命令逐条 commit；top 不提交。commit 失败只告警，继续。</p>
+        </div>
+        <div class="arrow"></div>
+
+        <div class="node">
+          <span class="tag">Load</span>
+          <h3>_load_config(session, deadline)</h3>
+          <p>发送 <code class="inline">load override ftp://...</code>，最多恢复后重试 3 次。</p>
+          <p style="margin-top:4px;">成功只认 <code class="inline">load complete</code>；非零 error count 直接失败；无 complete 则失败或恢复。</p>
+        </div>
+        <div class="arrow"></div>
+
+        <div class="node commit">
+          <span class="tag">Commit · Final</span>
+          <h3>_commit_and_verify(session, "final", timeout=remaining)</h3>
+          <p>生成独立 UUID；commit complete 只是候选成功，最终以 show system commit 最新已完成记录为准。</p>
+        </div>
+        <div class="arrow"></div>
+
+        <div class="node clean">
+          <span class="tag">finally</span>
+          <h3>_cleanup(ftp_server, telnet_client)</h3>
+          <p>删除 FTP 节点、关闭 Telnet、处理最后适配器自环；三者独立捕获异常，不覆盖原始失败。</p>
+        </div>
+      </div>
+
+      <div class="callout">
+        <b>分支：init_device()</b> — 不走 FTP；启动登录后执行 required 的
+        <code class="inline">top</code>、<code class="inline">delete chassis auto-image-upgrade</code>、
+        <code class="inline">set system host-name</code>、
+        <code class="inline">set chassis fpc 0 pic 0 number-of-ports 40</code>。
+        这些命令失败会直接向上抛出，不做 best-effort。
+      </div>
+    </section>
+
+    <section class="panel" id="boot">
+      <h2><span class="num">02</span>启动与登录</h2>
+      <p class="sub">
+        FIPS 判断已移除；启动完成由 login 提示符和空行探测决定。
+      </p>
+
+      <div class="two-col">
+        <div class="card">
+          <h3>wait_for_boot()</h3>
+          <ol class="steps">
+            <li><span class="n">1</span><span>读取 chunk，累计到 <code class="inline">state.output</code>。</span></li>
+            <li><span class="n">2</span><span><code class="inline">_prompt_kind()</code> 只从最后一条有效行识别提示符。</span></li>
+            <li><span class="n">3</span><span>候选提示符必须属于 <code class="inline">boot_prompts</code>；Juniper 只配了 <code class="inline">login</code>。</span></li>
+            <li><span class="n">4</span><span>稳定窗口满足后，清空 <code class="inline">pending_line</code>，发送一个空行。</span></li>
+            <li><span class="n">5</span><span>只检查 probe 之后的新输出；再次出现 login 才返回。</span></li>
+            <li><span class="n">6</span><span>超时则 TimeoutError，交给上层失败/恢复。</span></li>
+          </ol>
+          <div class="callout">
+            <b>为什么探测：</b>启动日志里的 login 片段、旧提示符或未响应的 getty 不能证明 console 已可交互。
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>enter_command_prompt()</h3>
+          <p style="margin:0;color:var(--muted);font-size:13px;">
+            按 profile 的 <code class="inline">login_actions</code> 和 <code class="inline">mode_steps</code> 驱动：
+          </p>
+          <div class="state-row">
+            <span class="state">login</span><span class="state-arrow">→</span>
+            <span class="state">password</span><span class="state-arrow">→</span>
+            <span class="state">shell</span><span class="state-arrow">→</span>
+            <span class="state">exec</span><span class="state-arrow">→</span>
+            <span class="state">config</span>
+          </div>
+          <ol class="steps" style="margin-top:12px;">
+            <li><span class="n">1</span><span>login 提示 → 发送 <code class="inline">root</code>。</span></li>
+            <li><span class="n">2</span><span>password 提示 → 发送 <code class="inline">admin123</code>。</span></li>
+            <li><span class="n">3</span><span>shell 提示 → 发送 <code class="inline">cli</code>。</span></li>
+            <li><span class="n">4</span><span>exec 提示 → 发送 <code class="inline">configure</code>。</span></li>
+            <li><span class="n">5</span><span>同一提示符最多重试 <code class="inline">MAX_RECOVERIES=3</code> 次。</span></li>
+            <li><span class="n">6</span><span>断线则重连、清空旧 buffer，再重新走状态机。</span></li>
+          </ol>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="exchange">
+      <h2><span class="num">03</span>命令交换与文本定位</h2>
+      <p class="sub">
+        命令结果不是靠“在整段回显里搜字符串”，而是先隔离，再按用途做锚定匹配。
+      </p>
+
+      <div class="card" style="margin-bottom:12px;">
+        <h3>exchange() 的读取循环</h3>
+        <ol class="steps">
+          <li><span class="n">1</span><span><code class="inline">ensure_ready()</code>：先 drain 残留；若停在非 command prompt 或断线，先 restore。</span></li>
+          <li><span class="n">2</span><span>发送一次完整命令行；<code class="inline">result.sent</code> 标记是否真正写出。</span></li>
+          <li><span class="n">3</span><span>持续读取 chunk，累计到 <code class="inline">result.output</code>，不做隐式丢弃。</span></li>
+          <li><span class="n">4</span><span>每次新 chunk 都检查期望提示符、非期望提示符和 success pattern。</span></li>
+          <li><span class="n">5</span><span>提示符出现后至少等 <code class="inline">PROMPT_SETTLE</code>；有 success pattern 时再给宽限。</span></li>
+          <li><span class="n">6</span><span>返回 <code class="inline">ConsoleResult</code>：output、sent、prompt、restore、success、timeout。</span></li>
+        </ol>
+      </div>
+
+      <h3 style="font-size:14px;margin:16px 0 9px;color:var(--muted);">analysis_text() 流水线</h3>
+      <div class="pipeline">
+        <div class="pipe"><b>raw output</b><span>命令 echo、输出、日志、prompt</span></div>
+        <div class="pipe-arrow">→</div>
+        <div class="pipe"><b>normalize</b><span>ANSI、退格、CRLF、NUL</span></div>
+        <div class="pipe-arrow">→</div>
+        <div class="pipe"><b>_strip_command_echo</b><span>行级删除第一条匹配 echo</span></div>
+        <div class="pipe-arrow">→</div>
+        <div class="pipe"><b>逐行过滤</b><span>空行、background、[edit ...]、prompt</span></div>
+        <div class="pipe-arrow">→</div>
+        <div class="pipe"><b>analysis_text</b><span>只用于结果判断的文本</span></div>
+      </div>
+
+      <div class="consumer-grid">
+        <div class="consumer"><b>prompt</b><span>_last_meaningful_line() + 有序 prompt 规则；只看最后有效行。</span></div>
+        <div class="consumer"><b>success</b><span>load complete / commit complete；锚定行首。</span></div>
+        <div class="consumer"><b>error</b><span>^error:；跳过 warning、background 和 ignore_pattern。</span></div>
+        <div class="consumer"><b>history</b><span>按记录正则解析 index/time/user；pending 和 comment 单独处理。</span></div>
+      </div>
+
+      <div class="two-col" style="margin-top:12px;">
+        <div class="card">
+          <h3>残留输出</h3>
+          <p style="margin:0;color:var(--muted);font-size:12.5px;">
+            <code class="inline">ensure_ready()</code> 在每条命令前 drain 残留，最多 2s / 安静 0.3s。
+            残留只打 debug 日志，不并入下一条命令结果；若残留停在 command prompt，直接认为就绪。
+          </p>
+        </div>
+        <div class="card">
+          <h3>第一条 echo</h3>
+          <p style="margin:0;color:var(--muted);font-size:12.5px;">
+            只删除第一条“整行等于命令”或“prompt + 命令”的行；后面的相同文本保留，
+            避免误删设备真实输出。普通输出行末尾碰巧出现命令文本时不会删除。
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="commit">
+      <h2><span class="num">04</span>Commit 状态机</h2>
+      <p class="sub">
+        commit 一旦发出，不自动重发；只有明确锁拒绝才重试同一 UUID。
+      </p>
+
+      <div class="commit-tree">
+        <div class="node commit">
+          <span class="tag">Start</span>
+          <h3>生成 comment = cfg-import-&lt;UUID&gt;，deadline = now + timeout</h3>
+          <p>timeout 必填，调用方传总预算剩余时间；timeout=0 时立即未确认，不会等待 1800s。</p>
+        </div>
+
+        <div class="commit-branches">
+          <div class="branch">
+            <b>未发出</b>
+            <p>result.sent == False。恢复会话，最多 3 次。</p>
+            <span class="result bad">仍失败 → 未确认</span>
+          </div>
+          <div class="branch">
+            <b>锁拒绝</b>
+            <p>明确 locked 且 prompt 已回。首次 + 3 次重试，每 5s。</p>
+            <span class="result warn">耗尽 → JunosCommandError</span>
+          </div>
+          <div class="branch">
+            <b>明确失败</b>
+            <p>^error: 或 configuration check-out failed。</p>
+            <span class="result bad">立即失败，不查历史</span>
+          </div>
+          <div class="branch">
+            <b>结果不明</b>
+            <p>commit complete、lost、ambiguous。</p>
+            <span class="result">查 show system commit</span>
+          </div>
+        </div>
+
+        <div class="node" style="border-left-color:var(--green);">
+          <span class="tag" style="color:var(--green);background:rgba(94,227,154,.10);">History</span>
+          <h3>_verify_commit_history()</h3>
+          <p>
+            解析最新已完成记录；comment 必须与本次 UUID 完全一致。
+            pending 不算完成；旧记录、echo 里的 UUID、comment 里的 error 都不算成功。
+          </p>
+          <div class="commit-branches" style="margin-top:10px;">
+            <div class="branch"><b>match</b><p>最新已完成 comment == UUID。</p><span class="result">成功</span></div>
+            <div class="branch"><b>mismatch</b><p>可读，但不是本次。</p><span class="result bad">验证失败</span></div>
+            <div class="branch"><b>no records / unreadable</b><p>无法确认。</p><span class="result warn">未确认</span></div>
+            <div class="branch"><b>prep commit</b><p>失败只告警，继续最终 load。</p><span class="result warn">best-effort</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout">
+        <b>总预算与 commit：</b>commit 不占用独立的 120/300 秒；它只拿
+        <code class="inline">_remaining(deadline)</code>。锁冲突用 3 次/5 秒的短重试，
+        持久锁快速失败，不再等 300 秒。
+      </div>
+    </section>
+
+    <section class="panel" id="sequence">
+      <h2><span class="num">05</span>一次导入的时序</h2>
+      <p class="sub">
+        成功路径；失败会在对应节点向上抛，finally 仍执行 cleanup。
+      </p>
+
+      <div class="seq">
+        <div class="seq-row">
+          <span class="seq-step">01</span>
+          <span class="actor">Caller</span><span class="seq-arrow">→</span>
+          <span class="actor manager">Manager</span>
+          <span class="seq-msg">import_cfg(path)</span>
+        </div>
+        <div class="seq-row">
+          <span class="seq-step">02</span>
+          <span class="actor manager">Manager</span><span class="seq-arrow">→</span>
+          <span class="actor console">Console</span>
+          <span class="seq-msg">wait_for_boot(remaining)</span>
+        </div>
+        <div class="seq-row">
+          <span class="seq-step">03</span>
+          <span class="actor console">Console</span><span class="seq-arrow">→</span>
+          <span class="actor device">Junos</span>
+          <span class="seq-msg">read boot output；login 候选 → 空行探测 → 新 login</span>
+        </div>
+        <div class="seq-row">
+          <span class="seq-step">04</span>
+          <span class="actor manager">Manager</span><span class="seq-arrow">→</span>
+          <span class="actor console">Console</span>
+          <span class="seq-msg">enter_command_prompt(boot_output, remaining)</span>
+        </div>
+        <div class="seq-row">
+          <span class="seq-step">05</span>
+          <span class="actor console">Console</span><span class="seq-arrow">→</span>
+          <span class="actor device">Junos</span>
+          <span class="seq-msg">root → admin123 → cli → configure → config</span>
+        </div>
+        <div class="seq-row">
+          <span class="seq-step">06</span>
+          <span class="actor manager">Manager</span><span class="seq-arrow">→</span>
+          <span class="actor ftp">FTP</span>
+          <span class="seq-msg">init_ftp_server → copy_file → link_ftp_server(adapter)</span>
+        </div>
+        <div class="seq-row">
+          <span class="seq-step">07</span>
+          <span class="actor manager">Manager</span><span class="seq-arrow">→</span>
+          <span class="actor console">Console</span>
+          <span class="seq-msg">_prepare_config：top / delete auto-image / ports / IP；逐条 best-effort commit</span>
+        </div>
+        <div class="seq-row">
+          <span class="seq-step">08</span>
+          <span class="actor manager">Manager</span><span class="seq-arrow">→</span>
+          <span class="actor console">Console</span>
+          <span class="seq-msg">_load_config：load override ftp://...</span>
+        </div>
+        <div class="seq-row">
+          <span class="seq-step">09</span>
+          <span class="actor console">Console</span><span class="seq-arrow">→</span>
+          <span class="actor device">Junos</span>
+          <span class="seq-msg">load complete (N errors) / error / prompt</span>
+        </div>
+        <div class="seq-row">
+          <span class="seq-step">10</span>
+          <span class="actor manager">Manager</span><span class="seq-arrow">→</span>
+          <span class="actor console">Console</span>
+          <span class="seq-msg">_commit_and_verify("final", remaining)</span>
+        </div>
+        <div class="seq-row">
+          <span class="seq-step">11</span>
+          <span class="actor console">Console</span><span class="seq-arrow">→</span>
+          <span class="actor device">Junos</span>
+          <span class="seq-msg">commit comment "cfg-import-&lt;UUID&gt;" → show system commit</span>
+        </div>
+        <div class="seq-row">
+          <span class="seq-step">12</span>
+          <span class="actor manager">Manager</span><span class="seq-arrow">→</span>
+          <span class="actor ftp">FTP</span>
+          <span class="seq-msg">finally：delete FTP node / close Telnet / loopback</span>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div class="footer">
+    根据当前 <code>juniper_vjunos_vmx.py</code> · <code>console_session.py</code> · <code>telnet_utils.py</code> 绘制。
+    单文件 HTML，无外部依赖。
+  </div>
+</div>
+</body>
+</html>
