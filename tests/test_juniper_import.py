@@ -452,6 +452,13 @@ class JuniperImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(fake.closed)
         self.assertIn(("loopback_last_adapter_for_uni",), calls)
 
+    def test_status_enums_are_stable_strings(self):
+        """验证状态枚举仍与旧字符串完全兼容。"""
+        self.assertEqual(juniper.LoadStatus.FAILED, "failed")
+        self.assertEqual(juniper.CommitDecision.COMPLETE, "complete")
+        self.assertEqual(str(juniper.HistoryDecision.MATCH), "match")
+        self.assertEqual(str(juniper.HistoryMatch.WAIT), "wait")
+
     async def test_load_requires_load_complete(self):
         fake = FakeJunosTelnet(fragment_size=0)
         fake.load_behaviors = ["no_complete"]

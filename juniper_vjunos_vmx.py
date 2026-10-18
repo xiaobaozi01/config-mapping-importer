@@ -16,7 +16,8 @@ import re
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from enum import Enum
+from typing import Any, Protocol
 
 from src.application.config.manager.ne_config_manager import NeConfigManager
 from src.common.config import AppSettings
@@ -32,6 +33,7 @@ try:
         ConsoleResult,
         ConsoleSession,
         ModeStep,
+        PromptName,
         PromptRule,
     )
 except ImportError:  # pragma: no cover - 独立测试时的回退路径
@@ -40,6 +42,7 @@ except ImportError:  # pragma: no cover - 独立测试时的回退路径
         ConsoleResult,
         ConsoleSession,
         ModeStep,
+        PromptName,
         PromptRule,
     )
 
@@ -57,10 +60,92 @@ log = logging.getLogger(__name__)
 emulation_instance: EmulationPlatform = EMULATION_CLASS.instance()
 app_settings = AppSettings.load_from_yaml()
 
-LoadStatus = Literal["failed", "complete", "no_complete", "recover"]
-CommitDecision = Literal["retry", "recover", "raise", "complete", "lost", "ambiguous"]
-HistoryDecision = Literal["match", "mismatch", "wait", "retry", "stop", "unconfirmed"]
-HistoryMatch = Literal["match", "mismatch", "wait"]
+
+class LoadStatus(str, Enum):
+    """load 输出分类。
+
+    做什么：统一加载成功、失败、缺标记和需恢复四种状态。
+    为什么：字符串状态容易拼错，且不利于类型检查。
+    """
+
+    FAILED = "failed"
+    COMPLETE = "complete"
+    NO_COMPLETE = "no_complete"
+    RECOVER = "recover"
+
+    def __str__(self) -> str:
+        """返回枚举值。
+
+        做什么：让日志显示字符串值而不是枚举名。
+        为什么：保持现有日志和比较输出兼容。
+        """
+        return self.value
+
+
+class CommitDecision(str, Enum):
+    """一次 commit 尝试后的决策。
+
+    做什么：统一重试、恢复、失败、完成、丢失和歧义。
+    为什么：主循环只按枚举分支，不比较散落字符串。
+    """
+
+    RETRY = "retry"
+    RECOVER = "recover"
+    RAISE = "raise"
+    COMPLETE = "complete"
+    LOST = "lost"
+    AMBIGUOUS = "ambiguous"
+
+    def __str__(self) -> str:
+        """返回枚举值。
+
+        做什么：让日志显示字符串值而不是枚举名。
+        为什么：保持现有日志和比较输出兼容。
+        """
+        return self.value
+
+
+class HistoryDecision(str, Enum):
+    """提交历史查询后的决策。
+
+    做什么：统一匹配、不匹配、等待、重试、停止和未确认。
+    为什么：历史核实循环需要明确的状态机。
+    """
+
+    MATCH = "match"
+    MISMATCH = "mismatch"
+    WAIT = "wait"
+    RETRY = "retry"
+    STOP = "stop"
+    UNCONFIRMED = "unconfirmed"
+
+    def __str__(self) -> str:
+        """返回枚举值。
+
+        做什么：让日志显示字符串值而不是枚举名。
+        为什么：保持现有日志和比较输出兼容。
+        """
+        return self.value
+
+
+class HistoryMatch(str, Enum):
+    """提交历史记录匹配结果。
+
+    做什么：统一匹配、不匹配和继续等待。
+    为什么：记录判断和查询决策职责不同，需要独立枚举。
+    """
+
+    MATCH = "match"
+    MISMATCH = "mismatch"
+    WAIT = "wait"
+
+    def __str__(self) -> str:
+        """返回枚举值。
+
+        做什么：让日志显示字符串值而不是枚举名。
+        为什么：保持现有日志和比较输出兼容。
+        """
+        return self.value
 
 
 class AdapterInfo(Protocol):
@@ -106,15 +191,15 @@ JUNOS_BACKGROUND_PATTERN = re.compile(r"(?i)Auto Image Upgrade")
 JUNOS_NOISE_PATTERN = re.compile(r"(?m)^\[edit[^\]]*\]\s*$")
 
 JUNOS_PROMPTS = (
-    PromptRule("config", JUNOS_EDIT_PATTERN),
-    PromptRule("shell", JUNOS_SHELL_PATTERN),
-    PromptRule("exec", JUNOS_CLI_PATTERN),
-    PromptRule("login", JUNOS_LOGIN_PATTERN),
-    PromptRule("password", JUNOS_PASSWORD_PATTERN),
+    PromptRule(PromptName.CONFIG, JUNOS_EDIT_PATTERN),
+    PromptRule(PromptName.SHELL, JUNOS_SHELL_PATTERN),
+    PromptRule(PromptName.EXEC, JUNOS_CLI_PATTERN),
+    PromptRule(PromptName.LOGIN, JUNOS_LOGIN_PATTERN),
+    PromptRule(PromptName.PASSWORD, JUNOS_PASSWORD_PATTERN),
 )
 JUNOS_MODE_STEPS = (
-    ModeStep("shell", "exec", "cli"),
-    ModeStep("exec", "config", "configure"),
+    ModeStep(PromptName.SHELL, PromptName.EXEC, "cli"),
+    ModeStep(PromptName.EXEC, PromptName.CONFIG, "configure"),
 )
 
 
@@ -127,11 +212,14 @@ def build_junos_console_profile(username: str, password: str) -> ConsoleProfile:
     return ConsoleProfile(
         name="juniper-vjunos",
         prompts=JUNOS_PROMPTS,
-        login_actions={"login": username, "password": password},
+        login_actions={
+            PromptName.LOGIN: username,
+            PromptName.PASSWORD: password,
+        },
         mode_steps=JUNOS_MODE_STEPS,
-        command_prompt="config",
+        command_prompt=PromptName.CONFIG,
         line_ending=b"\n",
-        boot_prompts=("login",),
+        boot_prompts=(PromptName.LOGIN,),
         error_patterns=(JUNOS_ERROR_PATTERN,),
         background_patterns=(JUNOS_BACKGROUND_PATTERN,),
         noise_patterns=(JUNOS_NOISE_PATTERN,),
@@ -659,16 +747,16 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
             explicit_error = session.find_explicit_error(text)
             status, detail = self._classify_load(result, text, explicit_error)
 
-            if status == "failed":
+            if status is LoadStatus.FAILED:
                 raise JunosCommandError(f"{self._node_id} Junos load failed: {detail}")
-            if status == "complete":
+            if status is LoadStatus.COMPLETE:
                 # 做什么：加载已确认时只恢复终端，不重新执行 load。
                 # 为什么：已经核实成功的阶段不应因会话刷新而重复执行。
                 if result.prompt_returned:
                     return
                 await self._restore_or_unconfirmed(session, result.output, "load recovery")
                 return
-            if status == "no_complete":
+            if status is LoadStatus.NO_COMPLETE:
                 raise JunosCommandError(
                     f"{self._node_id} Junos load returned to the prompt without "
                     f"'load complete':\n{self._tail(result.output)}"
@@ -703,7 +791,7 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
         complete, error_count = self._load_result(text)
 
         if complete and error_count is not None and error_count > 0:
-            return "failed", f"{error_count} error(s):\n{self._tail(result.output)}"
+            return LoadStatus.FAILED, f"{error_count} error(s):\n{self._tail(result.output)}"
         if complete:
             if explicit_error:
                 log.warning(
@@ -712,12 +800,12 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
                     self._node_id,
                     explicit_error,
                 )
-            return "complete", None
+            return LoadStatus.COMPLETE, None
         if explicit_error:
-            return "failed", f"{explicit_error}\n{self._tail(result.output)}"
+            return LoadStatus.FAILED, f"{explicit_error}\n{self._tail(result.output)}"
         if result.prompt_returned:
-            return "no_complete", None
-        return "recover", None
+            return LoadStatus.NO_COMPLETE, None
+        return LoadStatus.RECOVER, None
 
     def _load_result(self, text: str) -> tuple[bool, int | None]:
         """提取 load complete 和错误数量。
@@ -760,10 +848,10 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
             attempt = await self._commit_attempt(
                 session, command, stage, deadline, lock_retries
             )
-            if attempt.decision == "retry":
+            if attempt.decision is CommitDecision.RETRY:
                 lock_retries += 1
                 continue
-            if attempt.decision == "recover":
+            if attempt.decision is CommitDecision.RECOVER:
                 recoveries += 1
                 if recoveries > self.MAX_RECOVERIES:
                     raise JunosResultUnconfirmed(
@@ -774,14 +862,14 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
                     session, attempt.result.output, f"commit {comment}"
                 )
                 continue
-            if attempt.decision == "raise":
+            if attempt.decision is CommitDecision.RAISE:
                 raise JunosCommandError(attempt.error or "commit failed")
 
-            if attempt.decision == "complete":
+            if attempt.decision is CommitDecision.COMPLETE:
                 return await self._finish_commit_complete(
                     session, attempt.result, attempt.analysis, comment, stage, deadline
                 )
-            if attempt.decision == "lost":
+            if attempt.decision is CommitDecision.LOST:
                 return await self._finish_commit_lost(
                     session, attempt.result, comment, stage, deadline
                 )
@@ -820,25 +908,25 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
         )
 
         if not result.sent:
-            return CommitAttempt("recover", result)
+            return CommitAttempt(CommitDecision.RECOVER, result)
         if await self._retry_locked_commit(
             result, analysis, deadline, lock_retries
         ):
-            return CommitAttempt("retry", result, analysis)
+            return CommitAttempt(CommitDecision.RETRY, result, analysis)
         if analysis.complete:
-            return CommitAttempt("complete", result, analysis)
+            return CommitAttempt(CommitDecision.COMPLETE, result, analysis)
         detail = self._commit_failure_detail(result, analysis)
         if detail:
             return CommitAttempt(
-                "raise",
+                CommitDecision.RAISE,
                 result,
                 analysis,
                 f"{self._node_id} Junos commit failed ({stage}): {detail}\n"
                 f"{self._tail(result.output)}",
             )
         if result.restore_required or not result.prompt_returned:
-            return CommitAttempt("lost", result, analysis)
-        return CommitAttempt("ambiguous", result, analysis)
+            return CommitAttempt(CommitDecision.LOST, result, analysis)
+        return CommitAttempt(CommitDecision.AMBIGUOUS, result, analysis)
 
     def _commit_failure_detail(
         self,
@@ -1008,11 +1096,11 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
         while loop.time() < deadline:
             query = await self._run_history_query(session, deadline)
             decision = await self._evaluate_history_query(session, query, state, comment)
-            if decision == "match":
+            if decision is HistoryDecision.MATCH:
                 return True
-            if decision == "mismatch":
+            if decision is HistoryDecision.MISMATCH:
                 return False
-            if decision in ("stop", "unconfirmed"):
+            if decision in (HistoryDecision.STOP, HistoryDecision.UNCONFIRMED):
                 break
             await asyncio.sleep(
                 min(self.COMMIT_HISTORY_RETRY_INTERVAL, max(0.0, deadline - loop.time()))
@@ -1067,8 +1155,8 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
             if not await self._recover_history_query(
                 session, state, query.result.output
             ):
-                return "stop"
-            return "retry"
+                return HistoryDecision.STOP
+            return HistoryDecision.RETRY
 
         records = self._parse_commit_history(query.text)
         if not records:
@@ -1079,12 +1167,12 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
                     self._node_id,
                     error,
                 )
-                return "unconfirmed"
-            return "wait"
+                return HistoryDecision.UNCONFIRMED
+            return HistoryDecision.WAIT
         decision, detail = self._history_decision(records, comment)
-        if decision == "match":
-            return "match"
-        if decision == "mismatch":
+        if decision is HistoryMatch.MATCH:
+            return HistoryDecision.MATCH
+        if decision is HistoryMatch.MISMATCH:
             state.mismatches += 1
             log.warning(
                 "Latest completed Junos commit comment mismatch: node=%s expected=%r actual=%r",
@@ -1093,8 +1181,8 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
                 detail,
             )
             if state.mismatches >= self.COMMIT_HISTORY_MISMATCH_LIMIT:
-                return "mismatch"
-        return "wait"
+                return HistoryDecision.MISMATCH
+        return HistoryDecision.WAIT
 
     async def _recover_history_query(
         self,
@@ -1133,13 +1221,13 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
 
         if own_pending:
             log.info("Own Junos commit is still pending; waiting: node=%s", self._node_id)
-            return "wait", None
+            return HistoryMatch.WAIT, None
         if latest_completed is None:
             log.info("No completed Junos commit record is available yet; waiting: node=%s", self._node_id)
-            return "wait", None
+            return HistoryMatch.WAIT, None
         if latest_completed.comment == comment:
-            return "match", None
-        return "mismatch", latest_completed.comment
+            return HistoryMatch.MATCH, None
+        return HistoryMatch.MISMATCH, latest_completed.comment
 
     def _parse_commit_history(self, text: str) -> list[CommitRecord]:
         """解析 show system commit 输出。

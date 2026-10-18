@@ -28,6 +28,7 @@ try:
         ConsoleResult,
         ConsoleSession,
         ModeStep,
+        PromptName,
         PromptRule,
     )
 except ImportError:  # pragma: no cover - 独立测试时的回退路径
@@ -36,6 +37,7 @@ except ImportError:  # pragma: no cover - 独立测试时的回退路径
         ConsoleResult,
         ConsoleSession,
         ModeStep,
+        PromptName,
         PromptRule,
     )
 
@@ -84,19 +86,25 @@ class FtpServerInfo(Protocol):
 
 
 CISCO_PROMPTS: tuple[PromptRule, ...] = (
-    PromptRule("config", re.compile(r"(?m)^RP/\S+\(config[^)]*\)#[ \t]*$")),
-    PromptRule("exec", re.compile(r"(?m)^RP/\S+#[ \t]*$")),
     PromptRule(
-        "root_username",
+        PromptName.CONFIG,
+        re.compile(r"(?m)^RP/\S+\(config[^)]*\)#[ \t]*$"),
+    ),
+    PromptRule(PromptName.EXEC, re.compile(r"(?m)^RP/\S+#[ \t]*$")),
+    PromptRule(
+        PromptName.ROOT_USERNAME,
         re.compile(r"(?im)^Enter root-system username:[ \t]*$"),
     ),
-    PromptRule("secret", re.compile(r"(?im)^Enter secret(?: again)?:[ \t]*$")),
-    PromptRule("username", re.compile(r"(?im)^Username:[ \t]*$")),
-    PromptRule("password", re.compile(r"(?im)^Password:[ \t]*$")),
+    PromptRule(
+        PromptName.SECRET,
+        re.compile(r"(?im)^Enter secret(?: again)?:[ \t]*$"),
+    ),
+    PromptRule(PromptName.USERNAME, re.compile(r"(?im)^Username:[ \t]*$")),
+    PromptRule(PromptName.PASSWORD, re.compile(r"(?im)^Password:[ \t]*$")),
     # 做什么：只匹配已有 XR 回显中确认过的 commit 警告提示。
     # 为什么：不要用通用 [yes/no] 猜测未知交互，避免把普通输出当确认。
     PromptRule(
-        "confirm",
+        PromptName.CONFIRM,
         re.compile(r"(?im)^Do you wish to proceed.*\?[ \t]*$"),
     ),
 )
@@ -148,13 +156,15 @@ def build_cisco_console_profile(username: str, password: str) -> ConsoleProfile:
         name="cisco-xrv9k",
         prompts=CISCO_PROMPTS,
         login_actions={
-            "root_username": username,
-            "secret": password,
-            "username": username,
-            "password": password,
+            PromptName.ROOT_USERNAME: username,
+            PromptName.SECRET: password,
+            PromptName.USERNAME: username,
+            PromptName.PASSWORD: password,
         },
-        mode_steps=(ModeStep("exec", "config", "configure"),),
-        command_prompt="config",
+        mode_steps=(
+            ModeStep(PromptName.EXEC, PromptName.CONFIG, "configure"),
+        ),
+        command_prompt=PromptName.CONFIG,
         line_ending=b"\r\n",
         error_patterns=CISCO_CLI_ERROR_PATTERNS,
         background_patterns=(CISCO_BACKGROUND_PATTERN,),
@@ -385,7 +395,7 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
             result = await session.exchange(
                 "do terminal length 0",
                 timeout=self._remaining(deadline),
-                prompt_names={"config"},
+                prompt_names={PromptName.CONFIG},
             )
             if not result.prompt_returned:
                 log.warning("Cisco terminal length command did not return a prompt")
@@ -486,7 +496,7 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
         result = await session.exchange(
             command,
             timeout=self._remaining(deadline),
-            prompt_names={"exec"},
+            prompt_names={PromptName.EXEC},
         )
         self._check_result(
             session, result, command, CISCO_CLI_ERROR_PATTERNS
@@ -524,13 +534,13 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
         result = await session.exchange(
             command,
             timeout=self._remaining(deadline),
-            prompt_names={"config", "confirm"},
+            prompt_names={PromptName.CONFIG, PromptName.CONFIRM},
         )
-        if result.prompt_name == "confirm":
+        if result.prompt_name == PromptName.CONFIRM:
             result = await session.exchange(
                 "yes",
                 timeout=self._remaining(deadline),
-                prompt_names={"config"},
+                prompt_names={PromptName.CONFIG},
             )
         return result
 

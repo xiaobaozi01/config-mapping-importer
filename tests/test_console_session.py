@@ -16,6 +16,7 @@ from console_session import (
     ConsoleProfile,
     ConsoleSession,
     ModeStep,
+    PromptName,
     PromptRule,
     _split_terminal_lines,
 )
@@ -294,6 +295,12 @@ class ConsoleSessionTest(unittest.IsolatedAsyncioTestCase):
         analysis = session.analysis_text(output, "top")
 
         self.assertEqual(analysis, "some output")
+
+    async def test_prompt_name_is_stable_string_enum(self):
+        """验证提示符枚举仍与旧字符串完全兼容。"""
+        self.assertEqual(PromptName.CONFIG, "config")
+        self.assertEqual(str(PromptName.CONFIG), "config")
+        self.assertEqual(str(PromptName.CONFIRM), "confirm")
 
     async def test_find_explicit_error_accepts_stage_patterns(self):
         """验证调用方可以只使用当前阶段的错误模式。"""

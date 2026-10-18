@@ -16,6 +16,7 @@ import logging
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Protocol
 
 try:
@@ -24,6 +25,32 @@ except ImportError:  # pragma: no cover - 独立测试时的回退路径
     from telnet_utils import normalize_terminal_text
 
 log = logging.getLogger(__name__)
+
+
+class PromptName(str, Enum):
+    """内置 profile 使用的提示符名称。
+
+    做什么：统一 config/exec/login 等提示符标识。
+    为什么：避免在 ConsoleSession、Juniper 和 Cisco 中重复魔法字符串。
+    """
+
+    CONFIG = "config"
+    EXEC = "exec"
+    SHELL = "shell"
+    LOGIN = "login"
+    PASSWORD = "password"
+    USERNAME = "username"
+    ROOT_USERNAME = "root_username"
+    SECRET = "secret"
+    CONFIRM = "confirm"
+
+    def __str__(self) -> str:
+        """返回枚举值。
+
+        做什么：让日志显示 config 而不是 PromptName.CONFIG。
+        为什么：枚举值需要与现有字符串输出保持一致。
+        """
+        return self.value
 
 
 def _split_terminal_lines(buffer: str) -> tuple[list[str], str]:
