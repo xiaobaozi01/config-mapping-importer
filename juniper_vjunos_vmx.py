@@ -325,6 +325,18 @@ class HistoryState:
     last_error: str | None = None
 
 
+# 做什么：检查并补齐 system root-authentication。
+# 为什么：新启动设备可能没有该必填项，准备阶段的 commit 会直接失败。
+ROOT_AUTH_PROBE = "show configuration system root-authentication | display set"
+BOOTSTRAP_ROOT_HASH = (
+    "$6$cfgimport$LOP6Q3gLLSiNmYSAFQJGyzPljgxsHAV/"
+    "OI8ORCX9mxSl73WtOb0/Q49uRI2I3GMIW3f9pHoiD5hCYO9gr7KYR0"
+)
+BOOTSTRAP_ROOT_COMMAND = (
+    f'set system root-authentication encrypted-password "{BOOTSTRAP_ROOT_HASH}"'
+)
+
+
 class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
     """Juniper vJunos 配置导入管理器。
 
@@ -459,6 +471,7 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
             await session.enter_command_prompt(
                 boot_output, timeout=self._remaining(deadline)
             )
+            await self._ensure_root_authentication(session, deadline)
 
             # 做什么：直接调用父类的 FTP 能力。
             # 为什么：FTP 节点、上传和连线属于通用能力，Juniper 侧不应重复实现。
@@ -492,6 +505,7 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
         await session.enter_command_prompt(
             boot_output, timeout=self._remaining(deadline)
         )
+        await self._ensure_root_authentication(session, deadline)
 
         await self._required_config_command(
             session, "top", commit=False, deadline=deadline
@@ -533,6 +547,41 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
                 f"{self._node_id} needs at least two custom adapters for the FTP import"
             )
         return adapters[-2]
+
+    async def _ensure_root_authentication(
+        self,
+        session: ConsoleSession,
+        deadline: float,
+    ) -> None:
+        """确保 system root-authentication 存在。
+
+        做什么：查询认证配置，缺失时设置兜底密码并提交。
+        为什么：新启动设备可能没有该必填项，后续准备提交会失败。
+        """
+        await session.ensure_ready()
+        result = await session.exchange(
+            ROOT_AUTH_PROBE,
+            timeout=self._remaining(deadline),
+        )
+        if result.restore_required or not result.prompt_returned:
+            raise JunosResultUnconfirmed(
+                f"{self._node_id} root-authentication probe did not return a prompt; "
+                "result unconfirmed (结果未确认)"
+            )
+        text = session.analysis_text(result.output, ROOT_AUTH_PROBE)
+        error = session.find_explicit_error(text)
+        if error:
+            raise JunosCommandError(
+                f"{self._node_id} root-authentication probe failed: {error}"
+            )
+        if "root-authentication" in text:
+            return
+        await self._required_config_command(
+            session,
+            BOOTSTRAP_ROOT_COMMAND,
+            commit=True,
+            deadline=deadline,
+        )
 
     async def _prepare_config(self, session: ConsoleSession, deadline: float) -> None:
         """执行导入前的准备命令。

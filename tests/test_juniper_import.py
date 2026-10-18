@@ -189,6 +189,7 @@ class FakeJunosTelnet:
         self.background_log = ""
         self.load_count = 0
         self.commit_count = 0
+        self.root_auth_present = True
         self.history_query_count = 0
         self.reconnect_count = 0
         self.closed = False
@@ -262,6 +263,30 @@ class FakeJunosTelnet:
             self.enqueue(EDIT_PROMPT)
             return
 
+        if text in self.command_errors:
+            self.enqueue(text + "\r\n")
+            self.enqueue(self.command_errors[text] + "\r\n")
+            self.current_prompt = EDIT_PROMPT
+            self.enqueue(EDIT_PROMPT)
+            return
+
+        if text == juniper.ROOT_AUTH_PROBE:
+            self.enqueue(text + "\r\n")
+            if self.root_auth_present:
+                self.enqueue(
+                    'set system root-authentication encrypted-password "hash"\r\n'
+                )
+            self.current_prompt = EDIT_PROMPT
+            self.enqueue(EDIT_PROMPT)
+            return
+
+        if text.startswith("set system root-authentication "):
+            self.root_auth_present = True
+            self.enqueue(text + "\r\n")
+            self.current_prompt = EDIT_PROMPT
+            self.enqueue(EDIT_PROMPT)
+            return
+
         if text.startswith("load override "):
             self._handle_load(text)
             return
@@ -272,13 +297,6 @@ class FakeJunosTelnet:
 
         if text.startswith("run show system commit"):
             self._handle_history(text)
-            return
-
-        if text in self.command_errors:
-            self.enqueue(text + "\r\n")
-            self.enqueue(self.command_errors[text] + "\r\n")
-            self.current_prompt = EDIT_PROMPT
-            self.enqueue(EDIT_PROMPT)
             return
 
         self.enqueue(text + "\r\n")
@@ -459,6 +477,34 @@ class JuniperImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(str(juniper.HistoryDecision.MATCH), "match")
         self.assertEqual(str(juniper.HistoryMatch.WAIT), "wait")
 
+    async def test_missing_root_auth_is_bootstrapped(self):
+        fake = FakeJunosTelnet(fragment_size=0)
+        fake.root_auth_present = False
+        manager = make_manager(fake)
+
+        await manager.import_cfg("/tmp/adapted.cfg")
+
+        self.assertIn(juniper.BOOTSTRAP_ROOT_COMMAND, fake.written_commands())
+        self.assertTrue(fake.root_auth_present)
+        self.assertEqual(fake.commit_count, 5)
+
+    async def test_existing_root_auth_is_not_overwritten(self):
+        fake = FakeJunosTelnet(fragment_size=0)
+        manager = make_manager(fake)
+
+        await manager.import_cfg("/tmp/adapted.cfg")
+
+        self.assertNotIn(juniper.BOOTSTRAP_ROOT_COMMAND, fake.written_commands())
+        self.assertEqual(fake.commit_count, 4)
+
+    async def test_root_auth_probe_error_stops_import(self):
+        fake = FakeJunosTelnet(fragment_size=0)
+        fake.command_errors[juniper.ROOT_AUTH_PROBE] = "error: permission denied"
+        manager = make_manager(fake)
+
+        with self.assertRaises(juniper.JunosCommandError):
+            await manager.import_cfg("/tmp/adapted.cfg")
+
     async def test_load_requires_load_complete(self):
         fake = FakeJunosTelnet(fragment_size=0)
         fake.load_behaviors = ["no_complete"]
@@ -578,6 +624,20 @@ class JuniperImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("set system host-name router-1", commands)
         self.assertIn("set chassis fpc 0 pic 0 number-of-ports 40", commands)
         self.assertNotIn(("init_ftp_server",), manager.parent_calls)
+
+    async def test_init_device_bootstraps_missing_root_auth(self):
+        fake = FakeJunosTelnet(fragment_size=0)
+        fake.root_auth_present = False
+        manager = make_manager(fake)
+
+        await manager.init_device(fake, "router-1")
+
+        commands = fake.written_commands()
+        self.assertIn(juniper.BOOTSTRAP_ROOT_COMMAND, commands)
+        self.assertLess(
+            commands.index(juniper.BOOTSTRAP_ROOT_COMMAND),
+            commands.index("set system host-name router-1"),
+        )
 
     async def test_export_cfg_creates_empty_file(self):
         fake = FakeJunosTelnet(fragment_size=0)
