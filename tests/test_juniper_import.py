@@ -590,21 +590,28 @@ class JuniperImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(commit_commands), 2)
 
-    async def test_preparation_error_continues_when_prompt_returns(self):
+    async def test_preparation_error_aborts_before_load(self):
         fake = FakeJunosTelnet(fragment_size=0)
         fake.command_errors["delete chassis auto-image-upgrade"] = "error: statement not found"
         manager = make_manager(fake)
 
-        with self.assertLogs("juniper_vjunos_vmx", level="WARNING") as logs:
+        with self.assertRaises(juniper.JunosCommandError):
             await manager.import_cfg("/tmp/adapted.cfg")
 
-        self.assertTrue(any("explicitly failed" in line for line in logs.output))
-        self.assertEqual(fake.load_count, 1)
-        commit_commands = [
-            item for item in fake.written_commands() if item.startswith("commit comment ")
-        ]
-        # 做什么：delete 失败不影响统一准备提交和最终提交。
-        self.assertEqual(len(commit_commands), 2)
+        self.assertEqual(fake.load_count, 0)
+        self.assertEqual(fake.commit_count, 0)
+        self.assertTrue(fake.closed)
+
+    async def test_preparation_commit_error_aborts_before_load(self):
+        fake = FakeJunosTelnet(fragment_size=0)
+        fake.commit_error = "error: commit failed"
+        manager = make_manager(fake)
+
+        with self.assertRaises(juniper.JunosCommandError):
+            await manager.import_cfg("/tmp/adapted.cfg")
+
+        self.assertEqual(fake.load_count, 0)
+        self.assertEqual(fake.commit_count, 1)
 
     async def test_cleanup_error_does_not_override_success(self):
         fake = FakeJunosTelnet(fragment_size=0)
@@ -637,6 +644,17 @@ class JuniperImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("set system host-name router-1", commands)
         self.assertIn("set chassis fpc 0 pic 0 number-of-ports 40", commands)
         self.assertNotIn(("init_ftp_server",), manager.parent_calls)
+        self.assertEqual(fake.commit_count, 1)
+
+    async def test_init_device_command_error_stops_before_commit(self):
+        fake = FakeJunosTelnet(fragment_size=0)
+        fake.command_errors["delete chassis auto-image-upgrade"] = "error: denied"
+        manager = make_manager(fake)
+
+        with self.assertRaises(juniper.JunosCommandError):
+            await manager.init_device(fake, "router-1")
+
+        self.assertEqual(fake.commit_count, 0)
 
     async def test_init_device_bootstraps_missing_root_auth(self):
         fake = FakeJunosTelnet(fragment_size=0)
@@ -651,6 +669,7 @@ class JuniperImportScenarioTest(unittest.IsolatedAsyncioTestCase):
             commands.index(juniper.ROOT_AUTH_SET_COMMAND),
             commands.index("set system host-name router-1"),
         )
+        self.assertEqual(fake.commit_count, 2)
 
     async def test_export_cfg_creates_empty_file(self):
         fake = FakeJunosTelnet(fragment_size=0)

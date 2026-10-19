@@ -448,6 +448,24 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
         """
         return max(0.0, deadline - asyncio.get_running_loop().time())
 
+    async def _enter_config(
+        self,
+        session: ConsoleSession,
+        deadline: float,
+    ) -> None:
+        """完成启动、登录和 root-authentication 检查。
+
+        做什么：等待启动、进入 config，并确保 root-authentication 存在。
+        为什么：import_cfg 和 init_device 的入口流程完全相同。
+        """
+        boot_output = await session.wait_for_boot(
+            timeout=self._remaining(deadline)
+        )
+        await session.enter_command_prompt(
+            boot_output, timeout=self._remaining(deadline)
+        )
+        await self._ensure_root_authentication(session, deadline)
+
     async def import_cfg(self, local_cfg_path: str) -> None:
         """把本地配置导入路由器。
 
@@ -464,13 +482,7 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
                 self.init_telnet_client(), timeout=self._remaining(deadline)
             )
             session = self._console_session(telnet_client)
-            boot_output = await session.wait_for_boot(
-                timeout=self._remaining(deadline)
-            )
-            await session.enter_command_prompt(
-                boot_output, timeout=self._remaining(deadline)
-            )
-            await self._ensure_root_authentication(session, deadline)
+            await self._enter_config(session, deadline)
 
             # 做什么：直接调用父类的 FTP 能力。
             # 为什么：FTP 节点、上传和连线属于通用能力，Juniper 侧不应重复实现。
@@ -500,26 +512,21 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.OPERATION_TIMEOUT
         session = self._console_session(telnet_client)
-        boot_output = await session.wait_for_boot(timeout=self._remaining(deadline))
-        await session.enter_command_prompt(
-            boot_output, timeout=self._remaining(deadline)
-        )
-        await self._ensure_root_authentication(session, deadline)
+        await self._enter_config(session, deadline)
 
-        await self._required_config_command(
-            session, "top", commit=False, deadline=deadline
-        )
-        await self._required_config_command(
-            session, "delete chassis auto-image-upgrade", commit=True, deadline=deadline
-        )
-        await self._required_config_command(
-            session, f"set system host-name {sys_name}", commit=True, deadline=deadline
-        )
-        await self._required_config_command(
-            session,
+        init_commands = (
+            "top",
+            "delete chassis auto-image-upgrade",
+            f"set system host-name {sys_name}",
             "set chassis fpc 0 pic 0 number-of-ports 40",
-            commit=True,
-            deadline=deadline,
+        )
+        await self._run_config_commands(
+            session,
+            init_commands,
+            deadline,
+        )
+        await self._commit_and_verify(
+            session, "init-device", timeout=self._remaining(deadline)
         )
 
     async def export_cfg(self, local_cfg_path: str) -> None:
@@ -575,11 +582,16 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
             )
         if "root-authentication" in text:
             return
-        await self._required_config_command(
-            session,
+        await session.ensure_ready()
+        result = await session.exchange(
             ROOT_AUTH_SET_COMMAND,
-            commit=True,
-            deadline=deadline,
+            timeout=self._remaining(deadline),
+        )
+        self._handle_command_result(session, result, ROOT_AUTH_SET_COMMAND)
+        await self._commit_and_verify(
+            session,
+            "bootstrap-root-auth",
+            timeout=self._remaining(deadline),
         )
 
     async def _prepare_config(self, session: ConsoleSession, deadline: float) -> None:
@@ -588,192 +600,72 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
         做什么：逐条发送准备命令，最后统一提交一次。
         为什么：准备命令作用于同一个 candidate，没必要每条都产生 commit。
         """
-        await self._best_effort_config_command(
-            session, "top", commit=False, deadline=deadline
-        )
-
         port_count = len(self.node_info.custom_adapters) - 1
         interface = self._import_adapter().port_name
         prepare_commands = (
+            "top",
             "delete chassis auto-image-upgrade",
             f"set chassis fpc 0 pic 0 number-of-ports {port_count}",
             f"set interfaces {interface} unit 0 family inet address "
             f"{self.FTP_CLIENT_IP}/24",
         )
-        for command in prepare_commands:
-            await self._best_effort_config_command(
-                session,
-                command,
-                commit=False,
-                deadline=deadline,
-            )
+        await self._run_config_commands(
+            session,
+            prepare_commands,
+            deadline,
+        )
+        await self._commit_and_verify(
+            session,
+            "prepare-config",
+            timeout=self._remaining(deadline),
+        )
 
-        try:
-            await self._commit_and_verify(
-                session,
-                "prepare-config",
-                timeout=self._remaining(deadline),
-            )
-        except (JunosCommandError, JunosCommitVerificationError, JunosResultUnconfirmed) as exc:
-            log.warning(
-                "Junos preparation commit failed; continuing: "
-                "node=%s detail=%s",
-                self._node_id,
-                exc,
-            )
-
-    async def _best_effort_config_command(
+    async def _run_config_commands(
         self,
         session: ConsoleSession,
-        command: str,
-        commit: bool,
+        commands: tuple[str, ...],
         deadline: float,
-    ) -> bool:
-        """尽最大努力执行一条准备命令。
+    ) -> None:
+        """执行一组必须成功的配置命令。
 
-        做什么：命令明确失败或会话丢失时记录告警并返回 False。
-        为什么：准备项不是导入成功的前提，只要 FTP 已建立就应尽量继续 load。
+        做什么：逐条发送命令，任一失败立即抛异常。
+        为什么：准备和初始化共享相同的发送与结果检查流程。
         """
-        try:
+        for command in commands:
             await session.ensure_ready()
-            result = await session.exchange(command, timeout=self._remaining(deadline))
-            if not await self._prep_command_succeeded(session, result, command):
-                return False
-            if not commit:
-                return True
-            try:
-                await self._commit_and_verify(
-                    session, command, timeout=self._remaining(deadline)
-                )
-                return True
-            except (JunosCommandError, JunosCommitVerificationError, JunosResultUnconfirmed) as exc:
-                log.warning(
-                    "Junos preparation commit failed; continuing: "
-                    "node=%s command=%s detail=%s",
-                    self._node_id,
-                    command,
-                    exc,
-                )
-                return False
-        except (ConnectionError, TimeoutError, RuntimeError) as exc:
-            log.warning(
-                "Junos preparation command could not be completed; continuing: "
-                "node=%s command=%s detail=%s",
-                self._node_id,
-                command,
-                exc,
+            result = await session.exchange(
+                command, timeout=self._remaining(deadline)
             )
-            return False
+            self._handle_command_result(session, result, command)
 
-    async def _prep_command_succeeded(
+    def _handle_command_result(
         self,
         session: ConsoleSession,
         result: ConsoleResult,
         command: str,
-    ) -> bool:
-        """判断准备命令是否成功并处理会话丢失。
+    ) -> None:
+        """检查必须成功的命令结果。
 
-        做什么：检查会话恢复信号、明确错误和提示符返回情况。
-        为什么：准备命令的失败只应告警，不能中断后续加载。
+        做什么：遇到会话丢失、明确错误或未回 prompt 时抛出异常。
+        为什么：准备和初始化命令都是固定命令，失败应立即中止。
         """
         if result.restore_required:
-            log.warning(
-                "Junos preparation command lost the session; restoring and continuing: %s",
-                command,
+            raise JunosResultUnconfirmed(
+                f"{self._node_id} Junos session lost during {command!r}; "
+                "result unconfirmed (结果未确认)"
             )
-            try:
-                await session.restore(result.output)
-            except (ConnectionError, TimeoutError, RuntimeError) as exc:
-                log.warning(
-                    "Junos preparation session could not be restored; continuing: "
-                    "node=%s detail=%s",
-                    self._node_id,
-                    exc,
-                )
-            return False
-
         text = session.analysis_text(result.output, command)
         error = session.find_explicit_error(text)
         if error:
-            log.warning(
-                "Junos preparation command explicitly failed; continuing: "
-                "node=%s command=%s detail=%s",
-                self._node_id,
-                command,
-                error,
+            raise JunosCommandError(
+                f"{self._node_id} Junos command failed ({command}): {error}\n"
+                f"{self._tail(result.output)}"
             )
-            return False
-
         if not result.prompt_returned:
-            log.warning(
-                "Junos preparation command did not return a prompt; continuing: "
-                "node=%s command=%s output=%r",
-                self._node_id,
-                command,
-                self._tail(result.output),
+            raise JunosResultUnconfirmed(
+                f"{self._node_id} Junos command did not return a prompt "
+                f"({command}); result unconfirmed (结果未确认)"
             )
-            return False
-        return True
-
-    async def _required_config_command(
-        self,
-        session: ConsoleSession,
-        command: str,
-        commit: bool,
-        deadline: float,
-    ) -> None:
-        """执行必须成功的配置命令。
-
-        做什么：发送命令、检查错误、必要时恢复会话并提交。
-        为什么：init_device 的初始化业务必须可靠完成，不能像准备阶段一样忽略失败。
-        """
-        recoveries = 0
-        while True:
-            if self._remaining(deadline) <= 0:
-                raise JunosResultUnconfirmed(
-                    f"{self._node_id} operation timeout before command {command!r}; "
-                    "result unconfirmed (结果未确认)"
-                )
-            await session.ensure_ready()
-            result = await session.exchange(command, timeout=self._remaining(deadline))
-            text = session.analysis_text(result.output, command)
-
-            if result.restore_required:
-                recoveries += 1
-                if recoveries > self.MAX_RECOVERIES:
-                    raise JunosResultUnconfirmed(
-                        f"{self._node_id} Junos session could not be restored for {command!r}; "
-                        "result unconfirmed (结果未确认)"
-                    )
-                await self._restore_or_unconfirmed(
-                    session, result.output, f"command {command!r}"
-                )
-                continue
-
-            error = session.find_explicit_error(text)
-            if error:
-                raise JunosCommandError(
-                    f"{self._node_id} Junos command failed ({command}): {error}\n"
-                    f"{self._tail(result.output)}"
-                )
-
-            if not result.prompt_returned:
-                recoveries += 1
-                if recoveries > self.MAX_RECOVERIES:
-                    raise JunosResultUnconfirmed(
-                        f"{self._node_id} Junos command did not return a prompt ({command}); "
-                        "result unconfirmed (结果未确认)"
-                    )
-                await self._restore_or_unconfirmed(
-                    session, result.output, f"command {command!r}"
-                )
-                continue
-
-            if commit:
-                await self._commit_and_verify(
-                    session, command, timeout=self._remaining(deadline)
-                )
-            return
 
     # ------------------------------------------------------------------
     # 配置加载
