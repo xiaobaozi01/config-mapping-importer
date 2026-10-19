@@ -465,9 +465,9 @@ class JuniperImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("run show system commit | no-more", commands)
 
         commit_commands = [item for item in commands if item.startswith("commit comment ")]
-        self.assertEqual(len(commit_commands), 4)
+        self.assertEqual(len(commit_commands), 2)
         comments = [re.search(r'"(cfg-import-[^"]+)"', item).group(1) for item in commit_commands]
-        self.assertEqual(len(set(comments)), 4)
+        self.assertEqual(len(set(comments)), 2)
         self.assertEqual(fake.history[0][0], comments[-1])
 
         self.assertEqual(STATE["emulation"].deleted, [("project-1", "ftp-node")])
@@ -493,7 +493,7 @@ class JuniperImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("encrypted-password", juniper.ROOT_AUTH_SET_COMMAND)
         self.assertIn("$6$admin123$", juniper.ROOT_AUTH_SET_COMMAND)
         self.assertTrue(fake.root_auth_present)
-        self.assertEqual(fake.commit_count, 5)
+        self.assertEqual(fake.commit_count, 3)
 
     async def test_existing_root_auth_is_not_overwritten(self):
         fake = FakeJunosTelnet(fragment_size=0)
@@ -508,7 +508,7 @@ class JuniperImportScenarioTest(unittest.IsolatedAsyncioTestCase):
             commands,
         )
         self.assertNotIn(juniper.ROOT_AUTH_SET_COMMAND, commands)
-        self.assertEqual(fake.commit_count, 4)
+        self.assertEqual(fake.commit_count, 2)
 
     async def test_root_auth_probe_error_stops_import(self):
         fake = FakeJunosTelnet(fragment_size=0)
@@ -588,7 +588,7 @@ class JuniperImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         commit_commands = [
             item for item in fake.written_commands() if item.startswith("commit comment ")
         ]
-        self.assertEqual(len(commit_commands), 4)
+        self.assertEqual(len(commit_commands), 2)
 
     async def test_preparation_error_continues_when_prompt_returns(self):
         fake = FakeJunosTelnet(fragment_size=0)
@@ -603,8 +603,8 @@ class JuniperImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         commit_commands = [
             item for item in fake.written_commands() if item.startswith("commit comment ")
         ]
-        # 做什么：delete 失败不提交，后续端口、IP 和最终提交仍然执行。
-        self.assertEqual(len(commit_commands), 3)
+        # 做什么：delete 失败不影响统一准备提交和最终提交。
+        self.assertEqual(len(commit_commands), 2)
 
     async def test_cleanup_error_does_not_override_success(self):
         fake = FakeJunosTelnet(fragment_size=0)

@@ -585,36 +585,42 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
     async def _prepare_config(self, session: ConsoleSession, deadline: float) -> None:
         """执行导入前的准备命令。
 
-        做什么：回到顶层，关闭自动升级，设置端口数量和临时接口 IP。
-        为什么：这些准备项为 FTP 加载提供必要的设备状态，失败时按业务要求
-        记录告警并尽量继续。
+        做什么：逐条发送准备命令，最后统一提交一次。
+        为什么：准备命令作用于同一个 candidate，没必要每条都产生 commit。
         """
         await self._best_effort_config_command(
             session, "top", commit=False, deadline=deadline
         )
 
-        await self._best_effort_config_command(
-            session,
-            "delete chassis auto-image-upgrade",
-            commit=True,
-            deadline=deadline,
-        )
-
         port_count = len(self.node_info.custom_adapters) - 1
-        await self._best_effort_config_command(
-            session,
-            f"set chassis fpc 0 pic 0 number-of-ports {port_count}",
-            commit=True,
-            deadline=deadline,
-        )
-
         interface = self._import_adapter().port_name
-        await self._best_effort_config_command(
-            session,
-            f"set interfaces {interface} unit 0 family inet address {self.FTP_CLIENT_IP}/24",
-            commit=True,
-            deadline=deadline,
+        prepare_commands = (
+            "delete chassis auto-image-upgrade",
+            f"set chassis fpc 0 pic 0 number-of-ports {port_count}",
+            f"set interfaces {interface} unit 0 family inet address "
+            f"{self.FTP_CLIENT_IP}/24",
         )
+        for command in prepare_commands:
+            await self._best_effort_config_command(
+                session,
+                command,
+                commit=False,
+                deadline=deadline,
+            )
+
+        try:
+            await self._commit_and_verify(
+                session,
+                "prepare-config",
+                timeout=self._remaining(deadline),
+            )
+        except (JunosCommandError, JunosCommitVerificationError, JunosResultUnconfirmed) as exc:
+            log.warning(
+                "Junos preparation commit failed; continuing: "
+                "node=%s detail=%s",
+                self._node_id,
+                exc,
+            )
 
     async def _best_effort_config_command(
         self,
