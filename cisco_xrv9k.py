@@ -569,7 +569,13 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
         command = "do show configuration commit list"
         try:
             result = await self._run_command(session, command, deadline)
-        except (CiscoError, ConnectionError, TimeoutError, RuntimeError) as exc:
+        except CiscoCommandError as exc:
+            raise CiscoResultUnconfirmed(
+                f"{self._node_id} Cisco commit history query failed: {exc}"
+            ) from exc
+        except CiscoResultUnconfirmed:
+            return None
+        except (ConnectionError, TimeoutError, RuntimeError) as exc:
             log.warning(
                 "Cisco commit history query failed: node=%s detail=%s",
                 self._node_id,

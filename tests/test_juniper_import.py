@@ -474,12 +474,10 @@ class JuniperImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(fake.closed)
         self.assertIn(("loopback_last_adapter_for_uni",), calls)
 
-    def test_status_enums_are_stable_strings(self):
-        """验证状态枚举仍与旧字符串完全兼容。"""
+    def test_load_status_enum_is_stable_string(self):
+        """验证 load 状态枚举仍与旧字符串完全兼容。"""
         self.assertEqual(juniper.LoadStatus.FAILED, "failed")
-        self.assertEqual(juniper.CommitDecision.COMPLETE, "complete")
-        self.assertEqual(str(juniper.HistoryDecision.MATCH), "match")
-        self.assertEqual(str(juniper.HistoryMatch.WAIT), "wait")
+        self.assertEqual(str(juniper.LoadStatus.COMPLETE), "complete")
 
     async def test_missing_root_auth_is_bootstrapped(self):
         fake = FakeJunosTelnet(fragment_size=0)
@@ -877,11 +875,10 @@ class JuniperImportScenarioTest(unittest.IsolatedAsyncioTestCase):
 
         session = manager._console_session(fake)
         deadline = asyncio.get_running_loop().time() + 0.5
-        verified = await manager._verify_commit_history(
-            session, "cfg-import-good", deadline
-        )
-
-        self.assertIsNone(verified)
+        with self.assertRaises(juniper.JunosResultUnconfirmed):
+            await manager._verify_commit_history(
+                session, "cfg-import-good", deadline
+            )
 
     async def test_pending_record_is_not_a_completed_commit(self):
         fake = FakeJunosTelnet(fragment_size=0)

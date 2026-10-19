@@ -449,6 +449,16 @@ class CiscoImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(cisco.CISCO_BACKGROUND_PATTERN.search("% Invalid input detected"))
         self.assertIsNone(cisco.CISCO_BACKGROUND_PATTERN.search("% Authorization failed"))
 
+    async def test_history_query_error_fails_fast(self):
+        fake = FakeCiscoTelnet()
+        fake.command_errors["do show configuration commit list"] = "% Invalid input"
+        manager = make_manager(fake)
+        session = manager._console_session(fake)
+        deadline = asyncio.get_running_loop().time() + 5
+
+        with self.assertRaises(cisco.CiscoResultUnconfirmed):
+            await manager._verify_commit_history(session, "ci-test", deadline)
+
     async def test_commit_result_lost_recovers_from_history(self):
         fake = FakeCiscoTelnet()
         fake.commit_lost_at = 2

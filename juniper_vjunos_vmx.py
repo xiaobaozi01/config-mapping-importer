@@ -82,72 +82,6 @@ class LoadStatus(str, Enum):
         return self.value
 
 
-class CommitDecision(str, Enum):
-    """一次 commit 尝试后的决策。
-
-    做什么：统一重试、恢复、失败、完成、丢失和歧义。
-    为什么：主循环只按枚举分支，不比较散落字符串。
-    """
-
-    RETRY = "retry"
-    RECOVER = "recover"
-    RAISE = "raise"
-    COMPLETE = "complete"
-    LOST = "lost"
-    AMBIGUOUS = "ambiguous"
-
-    def __str__(self) -> str:
-        """返回枚举值。
-
-        做什么：让日志显示字符串值而不是枚举名。
-        为什么：保持现有日志和比较输出兼容。
-        """
-        return self.value
-
-
-class HistoryDecision(str, Enum):
-    """提交历史查询后的决策。
-
-    做什么：统一匹配、不匹配、等待、重试、停止和未确认。
-    为什么：历史核实循环需要明确的状态机。
-    """
-
-    MATCH = "match"
-    MISMATCH = "mismatch"
-    WAIT = "wait"
-    RETRY = "retry"
-    STOP = "stop"
-    UNCONFIRMED = "unconfirmed"
-
-    def __str__(self) -> str:
-        """返回枚举值。
-
-        做什么：让日志显示字符串值而不是枚举名。
-        为什么：保持现有日志和比较输出兼容。
-        """
-        return self.value
-
-
-class HistoryMatch(str, Enum):
-    """提交历史记录匹配结果。
-
-    做什么：统一匹配、不匹配和继续等待。
-    为什么：记录判断和查询决策职责不同，需要独立枚举。
-    """
-
-    MATCH = "match"
-    MISMATCH = "mismatch"
-    WAIT = "wait"
-
-    def __str__(self) -> str:
-        """返回枚举值。
-
-        做什么：让日志显示字符串值而不是枚举名。
-        为什么：保持现有日志和比较输出兼容。
-        """
-        return self.value
-
-
 class AdapterInfo(Protocol):
     """节点适配器的最小结构。
 
@@ -270,59 +204,6 @@ class CommitRecord:
     comment: str
     pending: bool
     raw: str
-
-
-@dataclass
-class CommitAnalysis:
-    """单次 commit 回显的分类结果。
-
-    做什么：把回显拆成完成、锁拒绝、失败和明确错误四类信号。
-    为什么：不同信号对应重试、失败或继续核实等不同动作。
-    """
-
-    complete: bool
-    locked: bool
-    failure: bool
-    error: str | None
-
-
-@dataclass
-class CommitAttempt:
-    """一次 commit 尝试的分类结果。
-
-    做什么：保存决策类型、命令交互结果和提交分析。
-    为什么：把“重试、恢复、提交失败、继续核实”等分支从主循环中分离。
-    """
-
-    decision: CommitDecision
-    result: ConsoleResult
-    analysis: CommitAnalysis | None = None
-    error: str | None = None
-
-
-@dataclass
-class HistoryQuery:
-    """一次提交历史查询的原始结果。
-
-    做什么：保存命令交互结果和分析文本。
-    为什么：查询恢复与历史记录判断需要分开处理。
-    """
-
-    result: ConsoleResult
-    text: str
-
-
-@dataclass
-class HistoryState:
-    """提交历史核实期间的状态。
-
-    做什么：保存恢复次数、comment 不一致次数和最后一次错误。
-    为什么：恢复次数和不一致次数都需要跨查询累计。
-    """
-
-    recoveries: int = 0
-    mismatches: int = 0
-    last_error: str | None = None
 
 
 # 做什么：检查并补齐 system root-authentication。
@@ -778,66 +659,60 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
     ) -> str:
         """提交配置并核实最新提交记录。
 
-        做什么：生成独立 UUID，循环执行 commit 尝试，并处理重试、恢复和核实。
-        为什么：只有最新已完成提交记录的 comment 与 UUID 完全一致，才能证明
-        本次配置真正提交成功。
+        做什么：发送 commit，处理锁/失败/结果丢失，再查询提交历史。
+        为什么：只有最新已完成 comment 与本次 UUID 一致，才能证明提交成功。
         """
         comment = f"cfg-import-{uuid.uuid4()}"
         command = f'commit comment "{comment}"'
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0.0, timeout)
-        recoveries = 0
         lock_retries = 0
+        recoveries = 0
         log.info("Junos commit start: node=%s stage=%s comment=%s", self._node_id, stage, comment)
 
         while loop.time() < deadline:
-            attempt = await self._commit_attempt(
-                session, command, stage, deadline, lock_retries
+            result, complete, locked, failure, error = await self._run_commit_command(
+                session, command, deadline
             )
-            if attempt.decision is CommitDecision.RETRY:
+            if not result.sent:
+                recoveries = await self._recover_unsent_commit(
+                    session, result, comment, recoveries
+                )
+                continue
+            if await self._retry_locked_commit(
+                result, complete, locked, deadline, lock_retries
+            ):
                 lock_retries += 1
                 continue
-            if attempt.decision is CommitDecision.RECOVER:
-                recoveries += 1
-                if recoveries > self.MAX_RECOVERIES:
-                    raise JunosResultUnconfirmed(
-                        f"{self._node_id} Junos commit command could not be sent; "
-                        "result unconfirmed (结果未确认)"
-                    )
+            if not complete and (failure or error):
+                raise JunosCommandError(
+                    f"{self._node_id} Junos commit failed ({stage}): "
+                    f"{error or 'configuration check-out failed'}\n"
+                    f"{self._tail(result.output)}"
+                )
+            if result.restore_required or not result.prompt_returned:
                 await self._restore_or_unconfirmed(
-                    session, attempt.result.output, f"commit {comment}"
+                    session, result.output, f"commit {comment}"
                 )
-                continue
-            if attempt.decision is CommitDecision.RAISE:
-                raise JunosCommandError(attempt.error or "commit failed")
-
-            if attempt.decision is CommitDecision.COMPLETE:
-                return await self._finish_commit_complete(
-                    session, attempt.result, attempt.analysis, comment, stage, deadline
-                )
-            if attempt.decision is CommitDecision.LOST:
-                return await self._finish_commit_lost(
-                    session, attempt.result, comment, stage, deadline
-                )
-            return await self._finish_commit_ambiguous(session, comment, stage, deadline)
+            return await self._finish_commit_verification(
+                session, comment, stage, complete, deadline
+            )
 
         raise JunosResultUnconfirmed(
             f"{self._node_id} operation timeout during commit ({stage}); "
             "result unconfirmed (结果未确认)"
         )
 
-    async def _commit_attempt(
+    async def _run_commit_command(
         self,
         session: ConsoleSession,
         command: str,
-        stage: str,
         deadline: float,
-        lock_retries: int,
-    ) -> CommitAttempt:
-        """执行一次 commit 尝试并分类结果。
+    ) -> tuple[ConsoleResult, bool, bool, bool, str | None]:
+        """执行一次 commit 并提取结果信号。
 
-        做什么：发送 commit comment，识别锁拒绝、完成、失败和结果丢失。
-        为什么：主循环只负责按分类结果决策，避免把大量分支堆在一个方法里。
+        做什么：发送 commit 并返回 complete/locked/failure/error 信号。
+        为什么：把一次命令交互从主循环中分离。
         """
         await session.ensure_ready()
         result = await session.exchange(
@@ -846,108 +721,80 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
             success_pattern=self.COMMIT_COMPLETE_PATTERN,
         )
         text = session.analysis_text(result.output, command)
-        analysis = CommitAnalysis(
-            complete=bool(self.COMMIT_COMPLETE_PATTERN.search(text)),
-            locked=bool(self.COMMIT_LOCK_PATTERN.search(text)),
-            failure=bool(self.COMMIT_FAILURE_PATTERN.search(text)),
-            error=session.find_explicit_error(text, ignore_pattern=self.COMMIT_LOCK_PATTERN),
+        return (
+            result,
+            bool(self.COMMIT_COMPLETE_PATTERN.search(text)),
+            bool(self.COMMIT_LOCK_PATTERN.search(text)),
+            bool(self.COMMIT_FAILURE_PATTERN.search(text)),
+            session.find_explicit_error(text, ignore_pattern=self.COMMIT_LOCK_PATTERN),
         )
 
-        if not result.sent:
-            return CommitAttempt(CommitDecision.RECOVER, result)
-        if await self._retry_locked_commit(
-            result, analysis, deadline, lock_retries
-        ):
-            return CommitAttempt(CommitDecision.RETRY, result, analysis)
-        if analysis.complete:
-            return CommitAttempt(CommitDecision.COMPLETE, result, analysis)
-        detail = self._commit_failure_detail(result, analysis)
-        if detail:
-            return CommitAttempt(
-                CommitDecision.RAISE,
-                result,
-                analysis,
-                f"{self._node_id} Junos commit failed ({stage}): {detail}\n"
-                f"{self._tail(result.output)}",
-            )
-        if result.restore_required or not result.prompt_returned:
-            return CommitAttempt(CommitDecision.LOST, result, analysis)
-        return CommitAttempt(CommitDecision.AMBIGUOUS, result, analysis)
-
-    def _commit_failure_detail(
+    async def _recover_unsent_commit(
         self,
+        session: ConsoleSession,
         result: ConsoleResult,
-        analysis: CommitAnalysis,
-    ) -> str | None:
-        """提取 commit 的明确失败原因。
+        comment: str,
+        recoveries: int,
+    ) -> int:
+        """恢复未发送成功的 commit 命令。
 
-        做什么：区分重试耗尽的锁冲突、明确失败和普通错误。
-        为什么：把失败分类从主流程中移出，避免主方法分支过多。
+        做什么：限制恢复次数，恢复会话后返回新的恢复计数。
+        为什么：未发送的命令可以安全重试，但不能无限恢复。
         """
-        if analysis.locked and result.prompt_returned:
-            return "configuration database locked; retry limit reached"
-        if analysis.failure:
-            return analysis.error or "commit failed"
-        return analysis.error
+        recoveries += 1
+        if recoveries > self.MAX_RECOVERIES:
+            raise JunosResultUnconfirmed(
+                f"{self._node_id} Junos commit command could not be sent; "
+                "result unconfirmed (结果未确认)"
+            )
+        await self._restore_or_unconfirmed(
+            session, result.output, f"commit {comment}"
+        )
+        return recoveries
 
     async def _retry_locked_commit(
         self,
         result: ConsoleResult,
-        analysis: CommitAnalysis,
+        complete: bool,
+        locked: bool,
         deadline: float,
         lock_retries: int,
     ) -> bool:
-        """处理被数据库锁拒绝的提交。
+        """处理数据库锁冲突。
 
-        做什么：确认是明确的锁拒绝且提示符已返回后，等待固定间隔返回 True。
-        为什么：只有明确未提交的锁拒绝才可以沿用同一 UUID 安全重试。
+        做什么：锁冲突且未完成时等待后重试，超过次数则失败。
+        为什么：只有明确未提交的锁拒绝才能安全重试。
         """
-        if analysis.complete or not analysis.locked or not result.prompt_returned:
+        if complete or not locked or not result.prompt_returned:
             return False
         if lock_retries >= self.COMMIT_LOCK_RETRY_ATTEMPTS:
-            return False
+            raise JunosCommandError(
+                f"{self._node_id} Junos commit failed: "
+                "configuration database locked; retry limit reached"
+            )
         remaining = self._remaining(deadline)
         if remaining <= 0:
             return False
         log.warning(
-            "Junos configuration database is locked; retrying commit in %ss: node=%s",
-            self.COMMIT_LOCK_RETRY_INTERVAL,
+            "Junos configuration database is locked; retrying commit: node=%s",
             self._node_id,
         )
         await asyncio.sleep(min(self.COMMIT_LOCK_RETRY_INTERVAL, remaining))
         return True
 
-    async def _finish_commit_complete(
+    async def _finish_commit_verification(
         self,
         session: ConsoleSession,
-        result: ConsoleResult,
-        analysis: CommitAnalysis | None,
         comment: str,
         stage: str,
+        complete: bool,
         deadline: float,
     ) -> str:
-        """处理 commit complete 的结果。
+        """核实提交历史并返回 comment。
 
-        做什么：记录同时出现的错误文本，恢复会话并查询提交历史。
-        为什么：commit complete 只是成功标记，最新提交记录才最终依据。
+        做什么：查询最新记录，处理成功、mismatch 和未确认。
+        为什么：只有最新已完成 comment 与本次一致才算成功。
         """
-        if analysis is None:
-            raise JunosResultUnconfirmed(
-                f"{self._node_id} Junos commit analysis missing; "
-                "result unconfirmed (结果未确认)"
-            )
-        if analysis.failure or analysis.error:
-            log.warning(
-                "Junos commit complete with extra error text; verifying history: "
-                "node=%s stage=%s detail=%s",
-                self._node_id,
-                stage,
-                analysis.error or "configuration check-out failed",
-            )
-
-        if not result.prompt_returned or result.restore_required:
-            await self._restore_or_unconfirmed(session, result.output, f"commit {comment}")
-
         verified = await self._verify_commit_history(session, comment, deadline)
         if verified is True:
             log.info(
@@ -957,68 +804,10 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
                 comment,
             )
             return comment
-        if verified is False:
+        if verified is False and complete:
             raise JunosCommitVerificationError(
                 f"{self._node_id} latest completed commit comment does not match "
                 f"{comment!r} ({stage})"
-            )
-        raise JunosResultUnconfirmed(
-            f"{self._node_id} Junos commit result could not be verified ({stage}); "
-            "result unconfirmed (结果未确认)"
-        )
-
-    async def _finish_commit_lost(
-        self,
-        session: ConsoleSession,
-        result: ConsoleResult,
-        comment: str,
-        stage: str,
-        deadline: float,
-    ) -> str:
-        """处理提交已发送但结果丢失的情况。
-
-        做什么：恢复会话后先查询提交历史，成功则返回，否则报告未确认。
-        为什么：结果不明时直接重发可能造成重复提交，必须先核实历史。
-        """
-        await self._restore_or_unconfirmed(session, result.output, f"commit {comment}")
-        verified = await self._verify_commit_history(session, comment, deadline)
-        if verified is True:
-            log.info(
-                "Junos commit recovered from history: node=%s stage=%s comment=%s",
-                self._node_id,
-                stage,
-                comment,
-            )
-            return comment
-        if verified is False:
-            raise JunosResultUnconfirmed(
-                f"{self._node_id} commit was sent but is not the latest completed "
-                f"commit ({stage}); result unconfirmed (结果未确认)"
-            )
-        raise JunosResultUnconfirmed(
-            f"{self._node_id} Junos commit result could not be verified ({stage}); "
-            "result unconfirmed (结果未确认)"
-        )
-
-    async def _finish_commit_ambiguous(
-        self,
-        session: ConsoleSession,
-        comment: str,
-        stage: str,
-        deadline: float,
-    ) -> str:
-        """处理既无成功标记也无明确错误的提交。
-
-        做什么：只查询提交历史，根据历史结果决定成功或未确认。
-        为什么：提示符已经返回但提交结果不明，重发不安全。
-        """
-        verified = await self._verify_commit_history(session, comment, deadline)
-        if verified is True:
-            return comment
-        if verified is False:
-            raise JunosResultUnconfirmed(
-                f"{self._node_id} Junos commit was not confirmed by the commit history "
-                f"({stage}); result unconfirmed (结果未确认)"
             )
         raise JunosResultUnconfirmed(
             f"{self._node_id} Junos commit result could not be verified ({stage}); "
@@ -1031,44 +820,47 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
         comment: str,
         deadline: float,
     ) -> bool | None:
-        """核实最新已完成提交记录。
+        """循环核实最新已完成提交记录。
 
-        做什么：循环查询 show system commit，解析并比较最新已完成记录的 comment。
-        为什么：命令回显、旧记录和 pending 记录都不能证明本次提交成功。
+        做什么：查询 show system commit，比较最新已完成记录的 comment。
+        为什么：命令回显、旧记录和 pending 记录都不能证明提交成功。
         """
         loop = asyncio.get_running_loop()
-        state = HistoryState()
-
+        mismatches = 0
         while loop.time() < deadline:
-            query = await self._run_history_query(session, deadline)
-            decision = await self._evaluate_history_query(session, query, state, comment)
-            if decision is HistoryDecision.MATCH:
+            latest = await self._run_history_query(session, comment, deadline)
+            if latest == comment:
                 return True
-            if decision is HistoryDecision.MISMATCH:
-                return False
-            if decision in (HistoryDecision.STOP, HistoryDecision.UNCONFIRMED):
-                break
+            if latest is not None:
+                mismatches += 1
+                log.warning(
+                    "Latest completed Junos commit comment mismatch: node=%s expected=%r actual=%r",
+                    self._node_id,
+                    comment,
+                    latest,
+                )
+                if mismatches >= self.COMMIT_HISTORY_MISMATCH_LIMIT:
+                    return False
             await asyncio.sleep(
                 min(self.COMMIT_HISTORY_RETRY_INTERVAL, max(0.0, deadline - loop.time()))
             )
-
         log.warning(
-            "Junos commit history verification unconfirmed: node=%s comment=%s detail=%s",
+            "Junos commit history verification unconfirmed: node=%s comment=%s",
             self._node_id,
             comment,
-            state.last_error,
         )
         return None
 
     async def _run_history_query(
         self,
         session: ConsoleSession,
+        comment: str,
         deadline: float,
-    ) -> HistoryQuery:
-        """执行一次提交历史查询。
+    ) -> str | None:
+        """执行一次提交历史查询并返回最新已完成 comment。
 
-        做什么：准备会话、发送 run show system commit 并分析输出。
-        为什么：把查询本身的异常收敛成可恢复的结果，主循环只负责决策。
+        做什么：发送 run show system commit，解析记录。
+        为什么：查询失败、pending 或无记录时返回 None，由外层继续等待。
         """
         query = "run show system commit | no-more"
         try:
@@ -1078,102 +870,25 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
                 timeout=self._remaining(deadline),
             )
         except (ConnectionError, TimeoutError, RuntimeError) as exc:
-            return HistoryQuery(
-                result=ConsoleResult(output=str(exc), restore_required=True),
-                text="",
-            )
-        text = session.analysis_text(result.output, query)
-        return HistoryQuery(result=result, text=text)
-
-    async def _evaluate_history_query(
-        self,
-        session: ConsoleSession,
-        query: HistoryQuery,
-        state: HistoryState,
-        comment: str,
-    ) -> HistoryDecision:
-        """评估一次历史查询结果。
-
-        做什么：处理会话恢复、无记录时的查询错误、pending、匹配和不匹配。
-        为什么：历史 comment 是用户文本，不能把其中的 error 当成查询失败。
-        """
-        if query.result.restore_required or not query.result.prompt_returned:
-            if not await self._recover_history_query(
-                session, state, query.result.output
-            ):
-                return HistoryDecision.STOP
-            return HistoryDecision.RETRY
-
-        records = self._parse_commit_history(query.text)
-        if not records:
-            error = session.find_explicit_error(query.text)
-            if error:
-                log.warning(
-                    "Junos commit history query failed: node=%s detail=%s",
-                    self._node_id,
-                    error,
-                )
-                return HistoryDecision.UNCONFIRMED
-            return HistoryDecision.WAIT
-        decision, detail = self._history_decision(records, comment)
-        if decision is HistoryMatch.MATCH:
-            return HistoryDecision.MATCH
-        if decision is HistoryMatch.MISMATCH:
-            state.mismatches += 1
             log.warning(
-                "Latest completed Junos commit comment mismatch: node=%s expected=%r actual=%r",
+                "Junos commit history query failed: node=%s detail=%s",
                 self._node_id,
-                comment,
-                detail,
+                exc,
             )
-            if state.mismatches >= self.COMMIT_HISTORY_MISMATCH_LIMIT:
-                return HistoryDecision.MISMATCH
-        return HistoryDecision.WAIT
-
-    async def _recover_history_query(
-        self,
-        session: ConsoleSession,
-        state: HistoryState,
-        initial_output: str,
-    ) -> bool:
-        """恢复历史查询前的会话。
-
-        做什么：限制恢复次数后执行登录并回到命令提示符。
-        为什么：历史查询必须在配置模式下通过 run 命令执行。
-        """
-        state.recoveries += 1
-        if state.recoveries > self.MAX_RECOVERIES:
-            state.last_error = "session recovery limit reached"
-            return False
-        try:
-            await session.restore(initial_output)
-        except (ConnectionError, TimeoutError, RuntimeError) as exc:
-            state.last_error = str(exc)
-            return False
-        return True
-
-    def _history_decision(
-        self,
-        records: list[CommitRecord],
-        comment: str,
-    ) -> tuple[HistoryMatch, str | None]:
-        """根据记录决定历史核实结果。
-
-        做什么：找出最新已完成记录，并检查本次提交是否仍处于 pending。
-        为什么：pending 记录尚未完成，即使旧记录可见也不能提前下结论。
-        """
+            return None
+        text = session.analysis_text(result.output, query)
+        records = self._parse_commit_history(text)
+        if not records:
+            error = session.find_explicit_error(text)
+            if error:
+                raise JunosResultUnconfirmed(
+                    f"{self._node_id} Junos commit history query failed: {error}"
+                )
+            return None
+        if any(record.pending and record.comment == comment for record in records):
+            return None
         latest_completed = next((record for record in records if not record.pending), None)
-        own_pending = any(record.pending and record.comment == comment for record in records)
-
-        if own_pending:
-            log.info("Own Junos commit is still pending; waiting: node=%s", self._node_id)
-            return HistoryMatch.WAIT, None
-        if latest_completed is None:
-            log.info("No completed Junos commit record is available yet; waiting: node=%s", self._node_id)
-            return HistoryMatch.WAIT, None
-        if latest_completed.comment == comment:
-            return HistoryMatch.MATCH, None
-        return HistoryMatch.MISMATCH, latest_completed.comment
+        return latest_completed.comment if latest_completed is not None else None
 
     def _parse_commit_history(self, text: str) -> list[CommitRecord]:
         """解析 show system commit 输出。
