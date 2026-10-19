@@ -484,7 +484,7 @@ class JuniperImportScenarioTest(unittest.IsolatedAsyncioTestCase):
 
         await manager.import_cfg("/tmp/adapted.cfg")
 
-        self.assertIn(juniper.BOOTSTRAP_ROOT_COMMAND, fake.written_commands())
+        self.assertIn(juniper.ROOT_AUTH_SET_COMMAND, fake.written_commands())
         self.assertTrue(fake.root_auth_present)
         self.assertEqual(fake.commit_count, 5)
 
@@ -494,7 +494,7 @@ class JuniperImportScenarioTest(unittest.IsolatedAsyncioTestCase):
 
         await manager.import_cfg("/tmp/adapted.cfg")
 
-        self.assertNotIn(juniper.BOOTSTRAP_ROOT_COMMAND, fake.written_commands())
+        self.assertNotIn(juniper.ROOT_AUTH_SET_COMMAND, fake.written_commands())
         self.assertEqual(fake.commit_count, 4)
 
     async def test_root_auth_probe_error_stops_import(self):
@@ -633,9 +633,9 @@ class JuniperImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         await manager.init_device(fake, "router-1")
 
         commands = fake.written_commands()
-        self.assertIn(juniper.BOOTSTRAP_ROOT_COMMAND, commands)
+        self.assertIn(juniper.ROOT_AUTH_SET_COMMAND, commands)
         self.assertLess(
-            commands.index(juniper.BOOTSTRAP_ROOT_COMMAND),
+            commands.index(juniper.ROOT_AUTH_SET_COMMAND),
             commands.index("set system host-name router-1"),
         )
 

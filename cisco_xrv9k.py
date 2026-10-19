@@ -220,6 +220,16 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
     OPERATION_TIMEOUT = 1800
     MAX_RECOVERIES = 3
 
+    # 做什么：限制提交历史查询的重试节奏和不一致次数。
+    # 为什么：commit 历史可能短暂滞后，不能只查询一次就判失败。
+    COMMIT_HISTORY_RETRY_INTERVAL = 2.0
+    COMMIT_HISTORY_MISMATCH_LIMIT = 2
+
+    # 做什么：限制 Cisco commit label 长度。
+    # 为什么：XR 的 commit label 最长 20 个字符，无法直接使用完整 UUID。
+    COMMIT_LABEL_PREFIX = "ci-"
+    COMMIT_LABEL_UUID_CHARS = 16
+
     # 做什么：统一 ConsoleSession 的轮询与稳定窗口节奏。
     # 为什么：测试和现场可能需要调整等待节奏。
     READ_INTERVAL = 0.2
@@ -318,7 +328,9 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
 
             await self._prepare_ftp(session, adapter, deadline)
             await self._load_config(session, deadline)
-            label = await self._commit_replace(session, deadline)
+            label = await self._commit_and_verify(
+                session, "final", timeout=self._remaining(deadline)
+            )
             log.info("Cisco XRv9k configuration imported: node=%s label=%s", self._node_id, label)
         finally:
             await self._cleanup(ftp_server, telnet_client)
@@ -364,6 +376,9 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
         做什么：设置 ftp source-interface、接口 IPv4 地址并提交。
         为什么：load 需要路由器能访问 FTP 服务器。
         """
+        await self._run_config_command(
+            session, "logging console disable", deadline
+        )
         await self._run_config_command(
             session, f"ftp client source-interface {adapter.port_name}", deadline
         )
@@ -425,14 +440,30 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
             patterns=CISCO_LOAD_ERROR_PATTERNS,
         )
 
-    async def _commit_replace(self, session: ConsoleSession, deadline: float) -> str:
+    # ------------------------------------------------------------------
+    # 提交与历史核实
+    # ------------------------------------------------------------------
+    async def _commit_and_verify(
+        self,
+        session: ConsoleSession,
+        stage: str,
+        timeout: float,
+    ) -> str:
         """用带 label 的 commit replace 提交配置并核实。
 
-        做什么：生成 UUID label，执行 commit replace，查询提交历史。
-        为什么：label 是 Cisco 提交历史的稳定标识，可替代脆弱的 hostname 判断。
+        做什么：生成 UUID label，执行 commit replace，循环查询提交历史。
+        为什么：只有最新 label 与本次 UUID 一致，才能证明本次提交成功。
         """
-        label = f"cfg-import-{uuid.uuid4()}"
+        label = f"{self.COMMIT_LABEL_PREFIX}{uuid.uuid4().hex[:self.COMMIT_LABEL_UUID_CHARS]}"
         command = f"commit label {label} replace"
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
+        log.info(
+            "Cisco commit start: node=%s stage=%s label=%s",
+            self._node_id,
+            stage,
+            label,
+        )
         await self._run_config_command(
             session,
             command,
@@ -440,29 +471,68 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
             patterns=CISCO_COMMIT_ERROR_PATTERNS,
         )
 
-        verified = await self._verify_commit_label(session, label, deadline)
+        verified = await self._verify_commit_history(session, label, deadline)
         if verified is True:
             log.info("Cisco XRv9k commit verified: node=%s label=%s", self._node_id, label)
             return label
         if verified is False:
             raise CiscoCommitVerificationError(
-                f"{self._node_id} latest Cisco commit label does not match {label!r}"
+                f"{self._node_id} latest Cisco commit label does not match "
+                f"{label!r} ({stage})"
             )
         raise CiscoResultUnconfirmed(
-            f"{self._node_id} Cisco commit result could not be verified; "
+            f"{self._node_id} Cisco commit result could not be verified ({stage}); "
             "result unconfirmed (结果未确认)"
         )
 
-    async def _verify_commit_label(
+    async def _verify_commit_history(
         self,
         session: ConsoleSession,
         label: str,
         deadline: float,
     ) -> bool | None:
-        """核实最新提交记录。
+        """循环核实最新提交记录。
 
-        做什么：执行 show configuration commit list，比较第一行 label。
-        为什么：提示符和 commit 回显不能替代提交历史。
+        做什么：查询 show configuration commit list，匹配 label 或等待历史更新。
+        为什么：提交历史可能短暂滞后，单次查询会把成功误判为未确认。
+        """
+        mismatches = 0
+        while self._remaining(deadline) > 0:
+            latest = await self._run_history_query(session, deadline)
+            if latest == label:
+                return True
+            if latest is not None:
+                mismatches += 1
+                log.warning(
+                    "Latest Cisco commit label mismatch: node=%s expected=%r actual=%r",
+                    self._node_id,
+                    label,
+                    latest,
+                )
+                if mismatches >= self.COMMIT_HISTORY_MISMATCH_LIMIT:
+                    return False
+            await asyncio.sleep(
+                min(
+                    self.COMMIT_HISTORY_RETRY_INTERVAL,
+                    self._remaining(deadline),
+                )
+            )
+        log.warning(
+            "Cisco commit history verification unconfirmed: node=%s label=%s",
+            self._node_id,
+            label,
+        )
+        return None
+
+    async def _run_history_query(
+        self,
+        session: ConsoleSession,
+        deadline: float,
+    ) -> str | None:
+        """执行一次提交历史查询。
+
+        做什么：执行 show configuration commit list，解析第一行 label。
+        为什么：查询失败或暂无记录应返回 None，由外层决定是否重试。
         """
         command = "do show configuration commit list"
         try:
@@ -474,12 +544,11 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
                 exc,
             )
             return None
-
         text = session.analysis_text(result.output, command)
         match = CISCO_COMMIT_ROW_PATTERN.search(text)
         if match is None:
             return None
-        return match.group(1) == label
+        return match.group(1)
 
     async def _run_exec_command(
         self,

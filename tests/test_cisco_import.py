@@ -162,6 +162,7 @@ class FakeCiscoTelnet:
         self.secret_count = 0
         self.history_label = ""
         self.history_override = None
+        self.history_override_queries = 0
         self.confirm_commit = False
         self.load_output = None
         self.show_failed_output = ""
@@ -268,7 +269,13 @@ class FakeCiscoTelnet:
             return
         if text == "do show configuration commit list":
             self.enqueue(text + "\r\n")
-            label = self.history_override if self.history_override is not None else self.history_label
+            label = self.history_label
+            if (
+                self.history_override is not None
+                and self.history_override_queries != 0
+            ):
+                label = self.history_override
+                self.history_override_queries -= 1
             self.enqueue("SNo. Label/ID User Line Client Time Stamp\r\n")
             self.enqueue(f"1 {label} root con0_RPs0_C CLI 00:00:00 UTC Mon Jan 01 2024\r\n")
             self.current_prompt = CONFIG
@@ -301,6 +308,7 @@ def make_manager(fake):
     manager.DRAIN_MAX = 0.02
     manager.BOOT_READY_SETTLE = 0.01
     manager.BOOT_NUDGE_INTERVAL = 0.05
+    manager.COMMIT_HISTORY_RETRY_INTERVAL = 0.01
     return manager
 
 
@@ -313,6 +321,7 @@ class CiscoImportScenarioTest(unittest.IsolatedAsyncioTestCase):
 
         commands = fake.writes
         self.assertIn("configure", commands)
+        self.assertIn("logging console disable", commands)
         self.assertIn("ftp client source-interface ge-0/0/0", commands)
         self.assertIn("interface ge-0/0/0", commands)
         self.assertIn("ipv4 address 10.0.0.2 255.255.255.0", commands)
@@ -322,6 +331,8 @@ class CiscoImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         commit_commands = [item for item in commands if item.startswith("commit label ")]
         self.assertEqual(len(commit_commands), 1)
         self.assertIn(fake.history_label, commit_commands[0])
+        self.assertLessEqual(len(fake.history_label), 20)
+        self.assertTrue(fake.history_label.startswith("ci-"))
         self.assertEqual(STATE["emulation"].deleted, [("project-1", "ftp-node")])
         self.assertTrue(fake.closed)
         self.assertIn(("loopback_last_adapter_for_uni",), manager.parent_calls)
@@ -335,9 +346,23 @@ class CiscoImportScenarioTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("yes", fake.writes)
 
+    async def test_commit_history_retries_until_label_matches(self):
+        fake = FakeCiscoTelnet()
+        fake.history_override = "old-label"
+        fake.history_override_queries = 1
+        manager = make_manager(fake)
+
+        await manager.import_cfg("/tmp/cisco.cfg")
+
+        self.assertEqual(
+            fake.writes.count("do show configuration commit list"),
+            2,
+        )
+
     async def test_commit_label_mismatch_fails(self):
         fake = FakeCiscoTelnet()
         fake.history_override = "other-label"
+        fake.history_override_queries = 2
         manager = make_manager(fake)
 
         with self.assertRaises(cisco.CiscoCommitVerificationError):

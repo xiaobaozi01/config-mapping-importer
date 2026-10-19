@@ -328,12 +328,10 @@ class HistoryState:
 # 做什么：检查并补齐 system root-authentication。
 # 为什么：新启动设备可能没有该必填项，准备阶段的 commit 会直接失败。
 ROOT_AUTH_PROBE = "show configuration system root-authentication | display set"
-BOOTSTRAP_ROOT_HASH = (
-    "$6$cfgimport$LOP6Q3gLLSiNmYSAFQJGyzPljgxsHAV/"
-    "OI8ORCX9mxSl73WtOb0/Q49uRI2I3GMIW3f9pHoiD5hCYO9gr7KYR0"
-)
-BOOTSTRAP_ROOT_COMMAND = (
-    f'set system root-authentication encrypted-password "{BOOTSTRAP_ROOT_HASH}"'
+BOOTSTRAP_ROOT_PASSWORD = "admin123"
+ROOT_AUTH_SET_COMMAND = (
+    "set system root-authentication plain-text-password-value "
+    f"{BOOTSTRAP_ROOT_PASSWORD}"
 )
 
 
@@ -578,7 +576,7 @@ class JuniperVjunosRouter23d2R1d15dConfigManager(NeConfigManager):
             return
         await self._required_config_command(
             session,
-            BOOTSTRAP_ROOT_COMMAND,
+            ROOT_AUTH_SET_COMMAND,
             commit=True,
             deadline=deadline,
         )
