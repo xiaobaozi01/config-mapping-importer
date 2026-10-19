@@ -327,11 +327,12 @@ class HistoryState:
 
 # 做什么：检查并补齐 system root-authentication。
 # 为什么：新启动设备可能没有该必填项，准备阶段的 commit 会直接失败。
-ROOT_AUTH_PROBE = "show configuration system root-authentication | display set"
-BOOTSTRAP_ROOT_PASSWORD = "admin123"
+ROOT_AUTH_PROBE = "show system root-authentication"
+BOOTSTRAP_ROOT_HASH = (
+    "$6$admin123$qkQUo1OlslMMLHPyx8kLQnBJKIZaPQsFkb7XxVevTdwU3L40gq0yjvrD2XbU1uKkZN38GonwTiTZnZ1euaZYB."
+)
 ROOT_AUTH_SET_COMMAND = (
-    "set system root-authentication plain-text-password-value "
-    f"{BOOTSTRAP_ROOT_PASSWORD}"
+    f'set system root-authentication encrypted-password "{BOOTSTRAP_ROOT_HASH}"'
 )
 
 

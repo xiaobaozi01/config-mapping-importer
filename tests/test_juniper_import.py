@@ -274,7 +274,11 @@ class FakeJunosTelnet:
             self.enqueue(text + "\r\n")
             if self.root_auth_present:
                 self.enqueue(
-                    'set system root-authentication encrypted-password "hash"\r\n'
+                    "system {\r\n"
+                    '    root-authentication {\r\n'
+                    '        encrypted-password "hash";\r\n'
+                    "    }\r\n"
+                    "}\r\n"
                 )
             self.current_prompt = EDIT_PROMPT
             self.enqueue(EDIT_PROMPT)
@@ -484,7 +488,10 @@ class JuniperImportScenarioTest(unittest.IsolatedAsyncioTestCase):
 
         await manager.import_cfg("/tmp/adapted.cfg")
 
-        self.assertIn(juniper.ROOT_AUTH_SET_COMMAND, fake.written_commands())
+        commands = fake.written_commands()
+        self.assertIn(juniper.ROOT_AUTH_SET_COMMAND, commands)
+        self.assertIn("encrypted-password", juniper.ROOT_AUTH_SET_COMMAND)
+        self.assertIn("$6$admin123$", juniper.ROOT_AUTH_SET_COMMAND)
         self.assertTrue(fake.root_auth_present)
         self.assertEqual(fake.commit_count, 5)
 
@@ -494,7 +501,13 @@ class JuniperImportScenarioTest(unittest.IsolatedAsyncioTestCase):
 
         await manager.import_cfg("/tmp/adapted.cfg")
 
-        self.assertNotIn(juniper.ROOT_AUTH_SET_COMMAND, fake.written_commands())
+        commands = fake.written_commands()
+        self.assertIn(juniper.ROOT_AUTH_PROBE, commands)
+        self.assertNotIn(
+            "show configuration system root-authentication | display set",
+            commands,
+        )
+        self.assertNotIn(juniper.ROOT_AUTH_SET_COMMAND, commands)
         self.assertEqual(fake.commit_count, 4)
 
     async def test_root_auth_probe_error_stops_import(self):
