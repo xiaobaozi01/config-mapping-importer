@@ -164,6 +164,9 @@ class FakeCiscoTelnet:
         self.history_override = None
         self.history_override_queries = 0
         self.confirm_commit = False
+        self.commit_lost_at = 0
+        self.commit_attempt_count = 0
+        self.load_unconfirmed_count = 0
         self.load_output = None
         self.show_failed_output = ""
         self.commit_after_yes_error = None
@@ -251,6 +254,11 @@ class FakeCiscoTelnet:
             return
         if text.startswith("load "):
             self.enqueue(text + "\r\n")
+            if self.load_unconfirmed_count > 0:
+                self.load_unconfirmed_count -= 1
+                self.current_prompt = ROOT_USERNAME
+                self.enqueue(ROOT_USERNAME)
+                return
             if self.load_output:
                 self.enqueue(self.load_output)
             self.current_prompt = CONFIG
@@ -260,6 +268,11 @@ class FakeCiscoTelnet:
             self.enqueue(text + "\r\n")
             label = text.split("commit label ", 1)[1].split()[0]
             self.history_label = label
+            self.commit_attempt_count += 1
+            if self.commit_attempt_count == self.commit_lost_at:
+                self.current_prompt = ROOT_USERNAME
+                self.enqueue(ROOT_USERNAME)
+                return
             if self.confirm_commit:
                 self.current_prompt = CONFIRM
                 self.enqueue(CONFIRM)
@@ -329,8 +342,10 @@ class CiscoImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("load ftp://ftpuser:ftppass@10.0.0.1/node-1.cfg", commands)
         self.assertIn("do show configuration commit list", commands)
         commit_commands = [item for item in commands if item.startswith("commit label ")]
-        self.assertEqual(len(commit_commands), 1)
-        self.assertIn(fake.history_label, commit_commands[0])
+        self.assertEqual(len(commit_commands), 2)
+        self.assertIn(fake.history_label, commit_commands[-1])
+        self.assertIn(" replace", commit_commands[-1])
+        self.assertNotIn(" replace", commit_commands[0])
         self.assertLessEqual(len(fake.history_label), 20)
         self.assertTrue(fake.history_label.startswith("ci-"))
         self.assertEqual(STATE["emulation"].deleted, [("project-1", "ftp-node")])
@@ -356,7 +371,7 @@ class CiscoImportScenarioTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             fake.writes.count("do show configuration commit list"),
-            2,
+            3,
         )
 
     async def test_commit_label_mismatch_fails(self):
@@ -388,7 +403,11 @@ class CiscoImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(cisco.CiscoCommandError):
             await manager.import_cfg("/tmp/cisco.cfg")
 
-        self.assertNotIn("commit label", " ".join(fake.writes))
+        commit_commands = [
+            item for item in fake.writes if item.startswith("commit label ")
+        ]
+        self.assertEqual(len(commit_commands), 1)
+        self.assertNotIn(" replace", commit_commands[0])
 
     async def test_load_file_error_fails(self):
         fake = FakeCiscoTelnet()
@@ -430,6 +449,31 @@ class CiscoImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(cisco.CISCO_BACKGROUND_PATTERN.search("% Invalid input detected"))
         self.assertIsNone(cisco.CISCO_BACKGROUND_PATTERN.search("% Authorization failed"))
 
+    async def test_commit_result_lost_recovers_from_history(self):
+        fake = FakeCiscoTelnet()
+        fake.commit_lost_at = 2
+        manager = make_manager(fake)
+
+        await manager.import_cfg("/tmp/cisco.cfg")
+
+        commit_commands = [
+            item for item in fake.writes if item.startswith("commit label ")
+        ]
+        self.assertEqual(len(commit_commands), 2)
+        self.assertIn(fake.history_label, commit_commands[-1])
+
+    async def test_load_retries_after_unconfirmed_result(self):
+        fake = FakeCiscoTelnet()
+        fake.load_unconfirmed_count = 1
+        manager = make_manager(fake)
+
+        await manager.import_cfg("/tmp/cisco.cfg")
+
+        load_commands = [
+            item for item in fake.writes if item.startswith("load ftp://")
+        ]
+        self.assertEqual(len(load_commands), 2)
+
     async def test_init_device_sets_hostname(self):
         fake = FakeCiscoTelnet()
         manager = make_manager(fake)
@@ -437,7 +481,12 @@ class CiscoImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         await manager.init_device(fake, "router1")
 
         self.assertIn("hostname router1", fake.writes)
-        self.assertIn("commit", fake.writes)
+        commit_commands = [
+            item for item in fake.writes if item.startswith("commit label ")
+        ]
+        self.assertEqual(len(commit_commands), 1)
+        self.assertNotIn(" replace", commit_commands[0])
+        self.assertIn("do show configuration commit list", fake.writes)
 
 
 if __name__ == "__main__":

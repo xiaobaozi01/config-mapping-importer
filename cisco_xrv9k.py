@@ -318,7 +318,9 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
                 self.init_telnet_client(), timeout=self._remaining(deadline)
             )
             session = self._console_session(telnet_client)
-            await session.enter_command_prompt("", timeout=self._remaining(deadline))
+            await session.enter_command_prompt(
+                "", timeout=self._remaining(deadline)
+            )
             await self._disable_paging(session, deadline)
 
             ftp_server = await self.init_ftp_server()
@@ -347,14 +349,15 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
         deadline = loop.time() + self.OPERATION_TIMEOUT
         session = self._console_session(telnet_client)
         await session.enter_command_prompt("", timeout=self._remaining(deadline))
-        await self._run_config_command(
+        await self._disable_paging(session, deadline)
+        await self._run_command(
             session, f"hostname {sys_name}", deadline
         )
-        await self._run_config_command(
+        await self._commit_and_verify(
             session,
-            "commit",
-            deadline,
-            patterns=CISCO_COMMIT_ERROR_PATTERNS,
+            "init-device",
+            timeout=self._remaining(deadline),
+            replace=False,
         )
 
     async def export_cfg(self, local_cfg_path: str) -> None:
@@ -376,29 +379,30 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
         做什么：设置 ftp source-interface、接口 IPv4 地址并提交。
         为什么：load 需要路由器能访问 FTP 服务器。
         """
-        await self._run_config_command(
-            session, "logging console disable", deadline
+        commands = (
+            "logging console disable",
+            f"ftp client source-interface {adapter.port_name}",
+            f"interface {adapter.port_name}",
+            f"ipv4 address {self.FTP_CLIENT_IP} 255.255.255.0",
+            "no shutdown",
         )
-        await self._run_config_command(
-            session, f"ftp client source-interface {adapter.port_name}", deadline
-        )
-        await self._run_config_command(
-            session, f"interface {adapter.port_name}", deadline
-        )
-        await self._run_config_command(
-            session, f"ipv4 address {self.FTP_CLIENT_IP} 255.255.255.0", deadline
-        )
-        await self._run_config_command(session, "no shutdown", deadline)
-        await self._run_config_command(
+        for command in commands:
+            await self._run_command(session, command, deadline)
+        await self._commit_and_verify(
             session,
-            "commit",
-            deadline,
-            patterns=CISCO_COMMIT_ERROR_PATTERNS,
+            "prepare-ftp",
+            timeout=self._remaining(deadline),
+            replace=False,
         )
         # 做什么：结束配置会话并重新进入全局配置模式。
         # 为什么：load 只能在全局配置模式执行，不能停在 config-if 子模式。
-        await self._run_exec_command(session, "end", deadline)
-        await self._run_config_command(session, "configure", deadline)
+        await self._run_command(
+            session,
+            "end",
+            deadline,
+            prompt_names=(PromptName.EXEC,),
+        )
+        await self._run_command(session, "configure", deadline)
 
     async def _disable_paging(self, session: ConsoleSession, deadline: float) -> None:
         """尽力关闭终端分页。
@@ -427,18 +431,31 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
             f"load ftp://{self.FTP_USER}:{self.FTP_PWD}@"
             f"{self.FTP_SERVER_IP}/{self._node_id}.cfg"
         )
-        await self._run_config_command(
-            session,
-            command,
-            deadline,
-            patterns=CISCO_LOAD_ERROR_PATTERNS,
-        )
-        await self._run_config_command(
-            session,
-            "show configuration failed load",
-            deadline,
-            patterns=CISCO_LOAD_ERROR_PATTERNS,
-        )
+        for attempt in range(self.MAX_RECOVERIES + 1):
+            try:
+                await self._run_command(
+                    session,
+                    command,
+                    deadline,
+                    patterns=CISCO_LOAD_ERROR_PATTERNS,
+                )
+                await self._run_command(
+                    session,
+                    "show configuration failed load",
+                    deadline,
+                    patterns=CISCO_LOAD_ERROR_PATTERNS,
+                )
+                return
+            except CiscoCommandError:
+                raise
+            except CiscoResultUnconfirmed:
+                if attempt >= self.MAX_RECOVERIES:
+                    raise
+                log.warning(
+                    "Cisco load result unconfirmed; retrying: node=%s attempt=%s",
+                    self._node_id,
+                    attempt + 1,
+                )
 
     # ------------------------------------------------------------------
     # 提交与历史核实
@@ -448,14 +465,15 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
         session: ConsoleSession,
         stage: str,
         timeout: float,
+        replace: bool = True,
     ) -> str:
-        """用带 label 的 commit replace 提交配置并核实。
+        """用带 label 的 commit 提交配置并核实。
 
-        做什么：生成 UUID label，执行 commit replace，循环查询提交历史。
+        做什么：生成 label，执行 commit（可选 replace），循环查询提交历史。
         为什么：只有最新 label 与本次 UUID 一致，才能证明本次提交成功。
         """
         label = f"{self.COMMIT_LABEL_PREFIX}{uuid.uuid4().hex[:self.COMMIT_LABEL_UUID_CHARS]}"
-        command = f"commit label {label} replace"
+        command = f"commit label {label}" + (" replace" if replace else "")
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0.0, timeout)
         log.info(
@@ -464,22 +482,36 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
             stage,
             label,
         )
-        await self._run_config_command(
-            session,
-            command,
-            deadline,
-            patterns=CISCO_COMMIT_ERROR_PATTERNS,
-        )
+        commit_error: CiscoResultUnconfirmed | None = None
+        try:
+            await self._run_command(
+                session,
+                command,
+                deadline,
+                patterns=CISCO_COMMIT_ERROR_PATTERNS,
+                allow_confirm=True,
+            )
+        except CiscoResultUnconfirmed as exc:
+            commit_error = exc
+            log.warning(
+                "Cisco commit result lost; checking history: node=%s label=%s",
+                self._node_id,
+                label,
+            )
 
         verified = await self._verify_commit_history(session, label, deadline)
         if verified is True:
             log.info("Cisco XRv9k commit verified: node=%s label=%s", self._node_id, label)
             return label
         if verified is False:
+            if commit_error is not None:
+                raise commit_error
             raise CiscoCommitVerificationError(
                 f"{self._node_id} latest Cisco commit label does not match "
                 f"{label!r} ({stage})"
             )
+        if commit_error is not None:
+            raise commit_error
         raise CiscoResultUnconfirmed(
             f"{self._node_id} Cisco commit result could not be verified ({stage}); "
             "result unconfirmed (结果未确认)"
@@ -536,7 +568,7 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
         """
         command = "do show configuration commit list"
         try:
-            result = await self._run_config_command(session, command, deadline)
+            result = await self._run_command(session, command, deadline)
         except (CiscoError, ConnectionError, TimeoutError, RuntimeError) as exc:
             log.warning(
                 "Cisco commit history query failed: node=%s detail=%s",
@@ -550,67 +582,36 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
             return None
         return match.group(1)
 
-    async def _run_exec_command(
-        self,
-        session: ConsoleSession,
-        command: str,
-        deadline: float,
-    ) -> ConsoleResult:
-        """执行一条 EXEC 模式命令。
-
-        做什么：确保会话就绪、发送命令并检查 exec 提示符。
-        为什么：end 等命令必须回到 exec，而不是 config。
-        """
-        await session.ensure_ready()
-        result = await session.exchange(
-            command,
-            timeout=self._remaining(deadline),
-            prompt_names={PromptName.EXEC},
-        )
-        self._check_result(
-            session, result, command, CISCO_CLI_ERROR_PATTERNS
-        )
-        return result
-
-    async def _run_config_command(
+    async def _run_command(
         self,
         session: ConsoleSession,
         command: str,
         deadline: float,
         patterns: tuple[re.Pattern[str], ...] = CISCO_CLI_ERROR_PATTERNS,
+        prompt_names: tuple[PromptName, ...] = (PromptName.CONFIG,),
+        allow_confirm: bool = False,
     ) -> ConsoleResult:
-        """执行一条配置模式命令。
+        """执行一条命令并检查阶段结果。
 
-        做什么：确保会话就绪、处理确认提示、检查阶段错误和提示符。
-        为什么：所有配置命令共享同一套校验逻辑，但错误模式按阶段传入。
+        做什么：发送命令、可选处理 confirm、检查错误和提示符。
+        为什么：配置命令、EXEC 命令和历史查询共享同一套交互逻辑。
         """
         await session.ensure_ready()
-        result = await self._exchange_with_confirm(session, command, deadline)
-        self._check_result(session, result, command, patterns)
-        return result
-
-    async def _exchange_with_confirm(
-        self,
-        session: ConsoleSession,
-        command: str,
-        deadline: float,
-    ) -> ConsoleResult:
-        """发送命令并处理一次确认提示。
-
-        做什么：如果返回 confirm 提示，发送 yes 后再等 config。
-        为什么：commit/commit replace 可能要求二次确认。
-        """
+        expected_prompts = set(prompt_names)
+        if allow_confirm:
+            expected_prompts.add(PromptName.CONFIRM)
         result = await session.exchange(
             command,
             timeout=self._remaining(deadline),
-            prompt_names={PromptName.CONFIG, PromptName.CONFIRM},
+            prompt_names=expected_prompts,
         )
-        if result.prompt_name == PromptName.CONFIRM:
+        if allow_confirm and result.prompt_name == PromptName.CONFIRM:
             result = await session.exchange(
                 "yes",
                 timeout=self._remaining(deadline),
                 prompt_names={PromptName.CONFIG},
             )
+        self._check_result(session, result, command, patterns)
         return result
 
     def _check_result(
