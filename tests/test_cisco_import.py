@@ -13,6 +13,7 @@ import os
 import sys
 import types
 import unittest
+from unittest.mock import AsyncMock, patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,7 +24,7 @@ SECRET_AGAIN = "Enter secret again: "
 EXEC = "RP/0/RP0/CPU0:ios# "
 CONFIG = "RP/0/RP0/CPU0:ios(config)# "
 CONFIG_IF = "RP/0/RP0/CPU0:ios(config-if)# "
-CONFIRM = "Do you wish to proceed with this commit anyway? "
+CONFIRM = "Do you wish to proceed? [no]: "
 
 
 def _new_module(name, registry):
@@ -173,6 +174,10 @@ class FakeCiscoTelnet:
         self.command_errors = {}
         self.closed = False
         self.reconnect_count = 0
+        self.target_loaded = False
+        self.load_count = 0
+        self.committed_targets = []
+        self.pending_label = None
         self.enqueue(ROOT_USERNAME)
 
     def enqueue(self, text):
@@ -206,6 +211,7 @@ class FakeCiscoTelnet:
         self.reconnect_count += 1
         self.connected = True
         self.current_prompt = ROOT_USERNAME
+        self.target_loaded = False
         self.enqueue(ROOT_USERNAME)
 
     def _handle(self, text):
@@ -213,6 +219,7 @@ class FakeCiscoTelnet:
             self.enqueue(self.current_prompt)
             return
         if text == "root":
+            self.target_loaded = False
             self.current_prompt = SECRET
             self.enqueue(SECRET)
             return
@@ -236,6 +243,8 @@ class FakeCiscoTelnet:
         if text == "yes":
             if self.commit_after_yes_error:
                 self.enqueue(self.commit_after_yes_error + "\r\n")
+            else:
+                self._record_commit()
             self.current_prompt = CONFIG
             self.enqueue(CONFIG)
             return
@@ -253,23 +262,27 @@ class FakeCiscoTelnet:
             self.enqueue(CONFIG)
             return
         if text.startswith("load "):
+            self.load_count += 1
             self.enqueue(text + "\r\n")
             if self.load_unconfirmed_count > 0:
                 self.load_unconfirmed_count -= 1
                 self.current_prompt = ROOT_USERNAME
+                self.target_loaded = False
                 self.enqueue(ROOT_USERNAME)
                 return
             if self.load_output:
                 self.enqueue(self.load_output)
+            self.target_loaded = True
             self.current_prompt = CONFIG
             self.enqueue(CONFIG)
             return
         if text.startswith("commit label "):
             self.enqueue(text + "\r\n")
             label = text.split("commit label ", 1)[1].split()[0]
-            self.history_label = label
+            self.pending_label = label
             self.commit_attempt_count += 1
             if self.commit_attempt_count == self.commit_lost_at:
+                self._record_commit()
                 self.current_prompt = ROOT_USERNAME
                 self.enqueue(ROOT_USERNAME)
                 return
@@ -277,6 +290,7 @@ class FakeCiscoTelnet:
                 self.current_prompt = CONFIRM
                 self.enqueue(CONFIRM)
             else:
+                self._record_commit()
                 self.current_prompt = CONFIG
                 self.enqueue(CONFIG)
             return
@@ -303,6 +317,11 @@ class FakeCiscoTelnet:
         self.current_prompt = CONFIG
         self.enqueue(CONFIG)
 
+    def _record_commit(self):
+        self.history_label = self.pending_label
+        self.committed_targets.append(self.target_loaded)
+        self.target_loaded = False
+
 
 def make_manager(fake):
     emulation = STATE["emulation"]
@@ -314,18 +333,158 @@ def make_manager(fake):
     manager._telnet_client = fake
     manager.parent_calls = []
     manager.fail_loopback = False
-    manager.OPERATION_TIMEOUT = 5
+    manager.COMMIT_HISTORY_MAX_ATTEMPTS = 3
+    manager.COMMIT_HISTORY_QUERY_TIMEOUT = .5
     manager.READ_INTERVAL = 0.001
     manager.PROMPT_SETTLE = 0.01
     manager.DRAIN_QUIET = 0.005
     manager.DRAIN_MAX = 0.02
-    manager.BOOT_READY_SETTLE = 0.01
-    manager.BOOT_NUDGE_INTERVAL = 0.05
+    manager.NUDGE_INTERVAL = 0.05
     manager.COMMIT_HISTORY_RETRY_INTERVAL = 0.01
     return manager
 
 
 class CiscoImportScenarioTest(unittest.IsolatedAsyncioTestCase):
+    async def test_reload_when_session_is_lost_before_final_commit(self):
+        fake = FakeCiscoTelnet()
+        manager = make_manager(fake)
+        load_config = manager._load_config
+
+        async def load_then_lose(session):
+            generation = await load_config(session)
+            if fake.load_count == 1:
+                fake.target_loaded = False
+                fake.current_prompt = ROOT_USERNAME
+                fake.enqueue(ROOT_USERNAME)
+            return generation
+
+        with patch.object(manager, "_load_config", side_effect=load_then_lose):
+            await manager.import_cfg("/tmp/cisco.cfg")
+        self.assertEqual(fake.load_count, 2)
+        self.assertEqual(fake.committed_targets, [False, True])
+
+    async def test_reload_when_session_changes_before_load_check(self):
+        fake = FakeCiscoTelnet()
+        manager = make_manager(fake)
+        run_command = manager._run_command
+
+        async def lose_before_check(session, command, **kwargs):
+            if command == "show configuration failed load" and fake.load_count == 1:
+                fake.target_loaded = False
+                fake.current_prompt = ROOT_USERNAME
+                fake.enqueue(ROOT_USERNAME)
+            return await run_command(session, command, **kwargs)
+
+        with patch.object(manager, "_run_command", side_effect=lose_before_check):
+            await manager.import_cfg("/tmp/cisco.cfg")
+        self.assertEqual(fake.load_count, 2)
+        self.assertEqual(fake.committed_targets, [False, True])
+
+    async def test_repeated_candidate_loss_stops_at_retry_limit(self):
+        fake = FakeCiscoTelnet()
+        manager = make_manager(fake)
+        load_config = manager._load_config
+
+        async def always_lose(session):
+            generation = await load_config(session)
+            fake.target_loaded = False
+            fake.current_prompt = ROOT_USERNAME
+            fake.enqueue(ROOT_USERNAME)
+            return generation
+
+        with patch.object(manager, "_load_config", side_effect=always_lose):
+            with self.assertRaises(cisco.CiscoCandidateLost):
+                await manager.import_cfg("/tmp/cisco.cfg")
+        self.assertEqual(fake.load_count, manager.MAX_RECOVERIES + 1)
+        self.assertEqual(fake.committed_targets, [False])
+        self.assertTrue(fake.closed)
+
+    async def test_confirmation_accepts_split_default_no_prompt(self):
+        fake = FakeCiscoTelnet()
+        fake.confirm_commit = True
+        enqueue = fake.enqueue
+
+        def split_confirmation(text):
+            if text == CONFIRM:
+                for char in text:
+                    enqueue(char)
+            else:
+                enqueue(text)
+
+        fake.enqueue = split_confirmation
+        await make_manager(fake).import_cfg("/tmp/cisco.cfg")
+        self.assertEqual(fake.writes.count("yes"), 2)
+        self.assertEqual(fake.committed_targets, [False, True])
+
+    async def test_confirmation_retains_errors_from_before_yes(self):
+        fake = FakeCiscoTelnet()
+        fake.confirm_commit = True
+        handle = fake._handle
+
+        def error_before_confirmation(text):
+            handle(text)
+            if text.startswith("commit label "):
+                fake.chunks.insert(-1, "% Failed to commit one or more configuration items\r\n")
+
+        fake._handle = error_before_confirmation
+        with self.assertRaises(cisco.CiscoCommandError):
+            await make_manager(fake).import_cfg("/tmp/cisco.cfg")
+
+    async def test_external_cancellation_cancels_hung_connection_and_runs_cleanup(self):
+        fake = FakeCiscoTelnet()
+        manager = make_manager(fake)
+
+        started = asyncio.Event()
+
+        async def hang():
+            started.set()
+            await asyncio.Event().wait()
+
+        manager.init_telnet_client = AsyncMock(side_effect=hang)
+        task = asyncio.create_task(manager.import_cfg("/tmp/config.cfg"))
+        await started.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(fake.writes, [])
+        self.assertIn(("loopback_last_adapter_for_uni",), manager.parent_calls)
+
+    async def test_external_cancellation_cancels_init_hung_login(self):
+        fake = FakeCiscoTelnet()
+        manager = make_manager(fake)
+        started = asyncio.Event()
+
+        async def hang():
+            started.set()
+            await asyncio.Event().wait()
+
+        fake.read_available = AsyncMock(side_effect=hang)
+        task = asyncio.create_task(manager.init_device(fake, "router1"))
+        await started.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(fake.writes, [])
+
+    async def test_external_cancellation_cancels_hung_preparation_and_cleans_up(self):
+        fake = FakeCiscoTelnet()
+        manager = make_manager(fake)
+        manager._disable_paging = AsyncMock()
+        started = asyncio.Event()
+
+        async def hang(*args):
+            started.set()
+            await asyncio.Event().wait()
+        manager.copy_file_to_ftp_server = AsyncMock(side_effect=hang)
+        task = asyncio.create_task(manager.import_cfg("/tmp/cisco.cfg"))
+        await started.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(fake.closed)
+        self.assertIn(("project-1", "ftp-node"), STATE["emulation"].deleted)
+        self.assertEqual(fake.load_count, 0)
+
     async def test_import_cfg_verifies_commit_label(self):
         fake = FakeCiscoTelnet()
         manager = make_manager(fake)
@@ -449,15 +608,133 @@ class CiscoImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(cisco.CISCO_BACKGROUND_PATTERN.search("% Invalid input detected"))
         self.assertIsNone(cisco.CISCO_BACKGROUND_PATTERN.search("% Authorization failed"))
 
+    async def test_history_uses_sixty_attempts_and_fixed_five_second_intervals(self):
+        manager = make_manager(FakeCiscoTelnet())
+        manager.COMMIT_HISTORY_MAX_ATTEMPTS = 60
+        manager.COMMIT_HISTORY_QUERY_TIMEOUT = 10
+        manager.COMMIT_HISTORY_RETRY_INTERVAL = 5
+        clock = SimpleNamespace(now=0.0, sleeps=[])
+
+        async def advance(delay):
+            clock.sleeps.append(delay)
+            clock.now += delay
+
+        async def unavailable(*args):
+            clock.now += 8
+            return None
+
+        query = AsyncMock(side_effect=unavailable)
+        limited = AsyncMock(wraps=asyncio.wait_for)
+        runtime = SimpleNamespace(sleep=advance, wait_for=limited)
+        with patch.object(cisco, "asyncio", runtime), patch.object(manager, "_run_history_query", query):
+            verified = await manager._verify_commit_history(None, "expected")
+        self.assertIsNone(verified)
+        self.assertEqual(query.await_count, 60)
+        self.assertEqual(clock.sleeps, [5] * 59)
+        self.assertEqual(clock.now, 60 * 8 + 59 * 5)
+        self.assertTrue(all(call.kwargs == {"timeout": 10} for call in limited.await_args_list))
+
+    async def test_each_history_query_cancels_hung_call_without_resending_commit(self):
+        fake = FakeCiscoTelnet()
+        manager = make_manager(fake)
+        manager.COMMIT_HISTORY_QUERY_TIMEOUT = .03
+        session = manager._console_session(fake)
+        handle = fake._handle
+        cancelled = asyncio.Event()
+        cancellations = []
+
+        async def hang():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+                cancellations.append(True)
+
+        def hang_on_history(command):
+            if command == "do show configuration commit list":
+                fake.read_available = AsyncMock(side_effect=hang)
+            else:
+                handle(command)
+
+        fake._handle = hang_on_history
+        with self.assertRaises(cisco.CiscoResultUnconfirmed):
+            await manager._commit_and_verify(session, "hung-history")
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(len(cancellations), manager.COMMIT_HISTORY_MAX_ATTEMPTS)
+        self.assertEqual(sum(command.startswith("commit label ") for command in fake.writes), 1)
+
+    async def test_history_query_timeout_covers_hung_readiness(self):
+        fake = FakeCiscoTelnet()
+        manager = make_manager(fake)
+        manager.COMMIT_HISTORY_MAX_ATTEMPTS = 2
+        manager.COMMIT_HISTORY_QUERY_TIMEOUT = .01
+        manager.COMMIT_HISTORY_RETRY_INTERVAL = 0
+        session = manager._console_session(fake)
+        cancellations = []
+
+        async def hang():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancellations.append(True)
+
+        session._ensure_ready = AsyncMock(side_effect=hang)
+        session.exchange = AsyncMock(side_effect=AssertionError("query sent before ready"))
+        verified = await manager._verify_commit_history(session, "expected")
+        self.assertIsNone(verified)
+        self.assertEqual(len(cancellations), 2)
+        session.exchange.assert_not_awaited()
+
+    async def test_history_timeout_consumes_attempt_and_next_query_can_succeed(self):
+        manager = make_manager(FakeCiscoTelnet())
+        manager.COMMIT_HISTORY_MAX_ATTEMPTS = 2
+        manager.COMMIT_HISTORY_QUERY_TIMEOUT = .01
+        manager.COMMIT_HISTORY_RETRY_INTERVAL = 0
+        cancelled = asyncio.Event()
+        attempts = []
+
+        async def query(*args):
+            attempts.append(True)
+            if len(attempts) == 1:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+            return "expected"
+
+        with patch.object(manager, "_run_history_query", new=AsyncMock(side_effect=query)) as queried:
+            verified = await manager._verify_commit_history(None, "expected")
+        self.assertTrue(verified)
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(queried.await_count, 2)
+
+    async def test_slow_commit_does_not_consume_history_query_timeout(self):
+        fake = FakeCiscoTelnet()
+        manager = make_manager(fake)
+        manager.COMMIT_HISTORY_QUERY_TIMEOUT = .04
+        manager.PROMPT_SETTLE = .001
+        manager.DRAIN_QUIET = .001
+        write = fake.write_line
+
+        async def slow_commit(content, line_ending=None):
+            if content.startswith("commit label "):
+                await asyncio.sleep(.06)
+            await write(content, line_ending)
+
+        fake.write_line = slow_commit
+        session = manager._console_session(fake)
+        result = await manager._commit_and_verify(session, "slow-commit")
+        self.assertTrue(result)
+        self.assertEqual(sum(command.startswith("commit label ") for command in fake.writes), 1)
+
     async def test_history_query_error_fails_fast(self):
         fake = FakeCiscoTelnet()
         fake.command_errors["do show configuration commit list"] = "% Invalid input"
         manager = make_manager(fake)
         session = manager._console_session(fake)
-        deadline = asyncio.get_running_loop().time() + 5
 
         with self.assertRaises(cisco.CiscoResultUnconfirmed):
-            await manager._verify_commit_history(session, "ci-test", deadline)
+            await manager._verify_commit_history(session, "ci-test")
 
     async def test_commit_result_lost_recovers_from_history(self):
         fake = FakeCiscoTelnet()
@@ -471,6 +748,8 @@ class CiscoImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(commit_commands), 2)
         self.assertIn(fake.history_label, commit_commands[-1])
+        self.assertEqual(fake.load_count, 1)
+        self.assertEqual(fake.committed_targets, [False, True])
 
     async def test_load_retries_after_unconfirmed_result(self):
         fake = FakeCiscoTelnet()

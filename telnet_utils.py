@@ -122,12 +122,7 @@ class TelnetClient:
     LINK_BREAK: bytes = b"\n"
     ENTER_KEY: bytes = b"\r"
 
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        telnet_client: _RawTelnet | None = None,
-    ) -> None:
+    def __init__(self, host: str, port: int, telnet_client: _RawTelnet | None=None) -> None:
         """建立 Telnet 连接。
 
         做什么：保存地址、初始化解码器并建立底层连接。
@@ -245,11 +240,7 @@ class TelnetClient:
             return data
         return self._telnet_decoder.decode(data, final=False)
 
-    async def write_line(
-        self,
-        content: str | bytes,
-        line_ending: bytes | None = None,
-    ) -> None:
+    async def write_line(self, content: str | bytes, line_ending: bytes | None=None) -> None:
         """写入一行并显式指定行结束符。
 
         做什么：保留完整内容，只在内容没有以换行结尾时追加 line_ending。
@@ -261,11 +252,7 @@ class TelnetClient:
             data += ending
         await self._write_bytes(data)
 
-    async def telnet_write(
-        self,
-        content: str | bytes,
-        sleep_time: float = TIME_INTERVAL,
-    ) -> None:
+    async def telnet_write(self, content: str | bytes, sleep_time: float=TIME_INTERVAL) -> None:
         """兼容写入一行。
 
         做什么：调用 write_line 追加 LF，并保留可选的写入前后沉降。

@@ -3,14 +3,17 @@
 """通用 ConsoleSession 的单元测试。
 
 做什么：用 Juniper-like 和 Cisco-like 两个 profile 验证登录、模式切换、
-命令交换、启动探测和文本分析。
-为什么：ConsoleSession 必须厂商无关，才能被 Juniper 和未来 Cisco 复用。
+命令交换、静默探测和文本分析。
+为什么：ConsoleSession 负责 Juniper 和 Cisco 共用的终端交互。
 """
 
 import asyncio
 import re
 import unittest
 from collections import deque
+from contextlib import contextmanager
+from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
 
 from console_session import (
     ConsoleProfile,
@@ -18,7 +21,6 @@ from console_session import (
     ModeStep,
     PromptName,
     PromptRule,
-    _split_terminal_lines,
 )
 
 
@@ -34,12 +36,11 @@ JUNOS_PROFILE = ConsoleProfile(
     prompts=JUNOS_PROMPTS,
     login_actions={"login": "root", "password": "admin123"},
     mode_steps=(
-        ModeStep("shell", "exec", "cli"),
-        ModeStep("exec", "config", "configure"),
+        ModeStep("shell", "cli"),
+        ModeStep("exec", "configure"),
     ),
     command_prompt="config",
     line_ending=b"\n",
-    boot_prompts=("login",),
     error_patterns=(re.compile(r"(?i)(?:error:|syntax error\b)"),),
     background_patterns=(re.compile(r"(?i)Auto Image Upgrade"),),
     noise_patterns=(re.compile(r"(?m)^\[edit[^\]]*\]\s*$"),),
@@ -63,7 +64,7 @@ CISCO_PROFILE = ConsoleProfile(
         "username": "root",
         "password": "secretpw",
     },
-    mode_steps=(ModeStep("exec", "config", "config"),),
+    mode_steps=(ModeStep("exec", "config"),),
     command_prompt="config",
     line_ending=b"\r\n",
     error_patterns=(
@@ -130,15 +131,50 @@ def make_session(fake, profile):
     session.PROMPT_SETTLE = 0.005
     session.DRAIN_QUIET = 0.003
     session.DRAIN_MAX = 0.02
-    session.BOOT_READY_SETTLE = 0.005
-    session.BOOT_NUDGE_INTERVAL = 0.05
     return session
 
 
-def boot_device(fake, content):
-    """模拟登录提示符对空行的响应。"""
-    if content == "":
-        fake.enqueue("router login: ")
+@contextmanager
+def exchange_clock(session):
+    """用虚拟时间验证探测间隔和总超时，避免测试依赖实际调度。"""
+    class Clock:
+        now = 0.0
+
+        def time(self):
+            return self.now
+
+        async def sleep(self, delay):
+            self.now += delay
+            await asyncio.sleep(0)
+
+        async def wait_for(self, awaitable, timeout):
+            task = asyncio.create_task(awaitable)
+            expires = self.now + timeout
+            try:
+                while not task.done():
+                    if self.now >= expires:
+                        task.cancel()
+                        try:
+                            return await task
+                        except asyncio.CancelledError:
+                            raise TimeoutError from None
+                    await asyncio.sleep(0)
+                return task.result()
+            finally:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+    clock = Clock()
+    session.READ_INTERVAL = 1.0
+    clock_api = SimpleNamespace(
+        get_running_loop=lambda: clock, sleep=clock.sleep, wait_for=clock.wait_for
+    )
+    with patch("console_session.asyncio", clock_api):
+        yield clock
 
 
 def junos_device(fake, command):
@@ -164,36 +200,244 @@ def junos_device(fake, command):
 
 
 class ConsoleSessionTest(unittest.IsolatedAsyncioTestCase):
-    async def test_wait_for_boot_probes_split_login(self):
-        """验证拆包登录提示和空行探测。"""
-        fake = ScriptedTelnet(on_write=boot_device)
-        fake.enqueue("router login: ", size=2)
+    async def test_expect_returns_boundary_and_caller_consumes_matched_prefix(self):
+        prefix = "banner\r\n\x1b[31mroot@router# \x1b[0m\r\n"
+        tail = "unconsumed tail\r\n"
+        fake = ScriptedTelnet(chunks=[prefix + tail])
         session = make_session(fake, JUNOS_PROFILE)
+        match = await session._expect({"config"}, first_prompt=True)
+        self.assertEqual(match.name, "config")
+        self.assertEqual(await session._expect({"config"}, first_prompt=True), match)
+        output = session._consume(match.end)
+        self.assertEqual(output, prefix)
+        self.assertEqual(await session.drain_residual(), tail)
+        self.assertEqual(await session.drain_residual(), "")
+        self.assertEqual(output, prefix)
 
-        output = await session.wait_for_boot(timeout=2)
+    async def test_generic_expect_only_waits_for_requested_prompt_stability(self):
+        fake = ScriptedTelnet(chunks=["root@router# "])
+        session = make_session(fake, JUNOS_PROFILE)
+        with exchange_clock(session) as clock:
+            match = await session._expect({"config"}, settle=2)
+        self.assertEqual(clock.time(), 2)
+        self.assertEqual(match.since, 0)
+        self.assertEqual(session._consume(match.end), "root@router# ")
 
-        self.assertIn("router login:", output)
-        self.assertEqual(fake.writes, [""])
+    async def test_exchange_with_success_marker_finishes_after_normal_settle(self):
+        fake = ScriptedTelnet(chunks=["commit\ncommit complete\nroot@router# "])
+        session = make_session(fake, JUNOS_PROFILE)
+        session.PROMPT_SETTLE = 2
+        with exchange_clock(session) as clock:
+            result = await session.exchange("commit", timeout=10, success_pattern=re.compile("commit complete"))
+        self.assertEqual(clock.time(), 2)
+        self.assertTrue(result.success_seen)
+        self.assertTrue(result.prompt_returned)
 
-    async def test_wait_for_boot_requires_probe_response(self):
-        """验证只有提示符、没有探测响应时不会假就绪。"""
+    async def test_exchange_ignores_success_pattern_in_command_echo_and_waits_grace(self):
+        fake = ScriptedTelnet(chunks=["commit complete\nroot@router# "])
+        session = make_session(fake, JUNOS_PROFILE)
+        session.PROMPT_SETTLE = 2
+        with exchange_clock(session) as clock:
+            result = await session.exchange(
+                "commit complete", timeout=10, success_pattern=re.compile("commit complete")
+            )
+        self.assertEqual(clock.time(), 4)
+        self.assertFalse(result.success_seen)
+        self.assertTrue(result.prompt_returned)
+
+    async def test_exchange_success_during_grace_does_not_restart_prompt_stability(self):
+        fake = ScriptedTelnet(chunks=["commit\nroot@router# \n", "", "", "commit complete\nroot@router# "])
+        session = make_session(fake, JUNOS_PROFILE)
+        session.PROMPT_SETTLE = 2
+        with exchange_clock(session) as clock:
+            result = await session.exchange("commit", timeout=10, success_pattern=re.compile("commit complete"))
+        self.assertEqual(clock.time(), 3)
+        self.assertTrue(result.success_seen)
+        self.assertTrue(result.prompt_returned)
+        self.assertEqual(fake.writes, ["commit"])
+
+    async def test_exchange_prompt_disappearing_during_grace_restarts_stability(self):
+        fake = ScriptedTelnet(chunks=["root@router# \n", "", "", "work in progress\n", "", "root@router# "])
+        session = make_session(fake, JUNOS_PROFILE)
+        session.PROMPT_SETTLE = 2
+        with exchange_clock(session) as clock:
+            result = await session.exchange("commit", timeout=12, success_pattern=re.compile("commit complete"))
+        self.assertEqual(clock.time(), 9)
+        self.assertTrue(result.prompt_returned)
+        self.assertFalse(result.success_seen)
+        self.assertIn("work in progress", result.output)
+
+    async def test_exchange_grace_uses_original_deadline(self):
+        fake = ScriptedTelnet(chunks=["root@router# \n"])
+        session = make_session(fake, JUNOS_PROFILE)
+        session.PROMPT_SETTLE = 2
+        with exchange_clock(session) as clock:
+            result = await session.exchange("commit", timeout=3, success_pattern=re.compile("commit complete"))
+        self.assertEqual(clock.time(), 3)
+        self.assertTrue(result.timed_out)
+        self.assertFalse(result.prompt_returned)
+        self.assertEqual(fake.writes, ["commit"])
+
+    async def test_exchange_login_during_grace_returns_restore_without_resending(self):
+        fake = ScriptedTelnet(chunks=["root@router# \n", "", "", "router login: "])
+        session = make_session(fake, JUNOS_PROFILE)
+        session.PROMPT_SETTLE = 2
+        with exchange_clock(session) as clock:
+            result = await session.exchange("commit", timeout=10, success_pattern=re.compile("commit complete"))
+        self.assertEqual(clock.time(), 3)
+        self.assertTrue(result.restore_required)
+        self.assertFalse(result.prompt_returned)
+        self.assertEqual(result.prompt_name, "login")
+        self.assertEqual(fake.writes, ["commit"])
+
+    async def test_login_consumes_multiple_prompts_from_one_read(self):
+        fake = ScriptedTelnet(chunks=["router login:\r\nPassword:\r\nroot@router# "])
+        session = make_session(fake, JUNOS_PROFILE)
+        await session.enter_command_prompt(timeout=1)
+        self.assertEqual(fake.writes, ["root", "admin123"])
+        self.assertEqual(await session.drain_residual(), "")
+
+    async def test_login_retains_partial_next_prompt_when_consuming_current_prompt(self):
+        def complete_password(fake, content):
+            if content == "root":
+                fake.chunks.append("word:\r\nroot@router# ")
+
+        fake = ScriptedTelnet(chunks=["router login:\r\nPass"], on_write=complete_password)
+        session = make_session(fake, JUNOS_PROFILE)
+        await session.enter_command_prompt(timeout=1)
+        self.assertEqual(fake.writes, ["root", "admin123"])
+
+    async def test_exchange_keeps_trailing_logs_for_drain(self):
+        tail = "Auto Image Upgrade: busy\r\n"
+        fake = ScriptedTelnet(chunks=["show\r\nresult\r\nroot@router# \r\n" + tail])
+        session = make_session(fake, JUNOS_PROFILE)
+        response = await session.exchange("show", timeout=1)
+        self.assertTrue(response.prompt_returned)
+        self.assertNotIn(tail, response.output)
+        self.assertEqual(await session.drain_residual(), tail)
+        self.assertIn("result", response.output)
+
+    async def test_consecutive_exchanges_do_not_reuse_success_or_prompt(self):
+        fake = ScriptedTelnet(on_write=junos_device)
+        session = make_session(fake, JUNOS_PROFILE)
+        pattern = re.compile("commit complete")
+        first = await session.exchange("commit", timeout=1, success_pattern=pattern)
+        first_output = first.output
+        second = await session.exchange("top", timeout=1, success_pattern=pattern)
+        self.assertTrue(first.success_seen)
+        self.assertFalse(second.success_seen)
+        self.assertNotIn("commit complete", second.output)
+        self.assertEqual(first.output, first_output)
+
+    async def test_timeout_result_consumes_partial_output_once(self):
+        fake = ScriptedTelnet(chunks=["partial output"])
+        session = make_session(fake, JUNOS_PROFILE)
+        with exchange_clock(session):
+            result = await session.exchange("show", timeout=2)
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.output, "partial output")
+        self.assertEqual(await session.drain_residual(), "")
+
+    async def test_cancellation_preserves_unconsumed_output_for_recovery(self):
         fake = ScriptedTelnet()
-        fake.enqueue("router login: ")
+        waiting = asyncio.Event()
+
+        async def read():
+            if not waiting.is_set():
+                waiting.set()
+                return "partial output"
+            await asyncio.Event().wait()
+
+        fake.read_available = AsyncMock(side_effect=read)
         session = make_session(fake, JUNOS_PROFILE)
+        task = asyncio.create_task(session.exchange("show"))
+        await waiting.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        fake.read_available = AsyncMock(return_value="")
+        self.assertEqual(await session.drain_residual(), "partial output")
 
-        with self.assertRaises(TimeoutError):
-            await session.wait_for_boot(timeout=0.05)
+    async def test_reconnect_discards_unconsumed_partial_prompt(self):
+        fake = ScriptedTelnet(chunks=["root@route"], on_write=junos_device)
+        session = make_session(fake, JUNOS_PROFILE)
+        await session._read()
+        fake.connected = False
+        await session.restore(timeout=1)
+        self.assertEqual(fake.writes, ["root", "admin123", "cli", "configure"])
+        self.assertEqual((await session.drain_residual()).strip(), "")
 
-        self.assertIn("", fake.writes)
+    async def test_login_and_exchange_share_idle_probe_timing(self):
+        for operation in ("enter_command_prompt", "exchange"):
+            with self.subTest(operation=operation):
+                probes = []
+                prompt = "root@router# "
 
-    async def test_wait_for_boot_ignores_non_boot_prompt(self):
-        """验证非 login 提示符不能结束启动等待。"""
+                def respond(fake, content):
+                    if content == "":
+                        probes.append(clock.time())
+                        if clock.time() >= 6:
+                            fake.chunks.append(prompt)
+
+                fake = ScriptedTelnet(on_write=respond)
+                session = make_session(fake, JUNOS_PROFILE)
+                session.NUDGE_INTERVAL = 3
+                with exchange_clock(session) as clock:
+                    if operation == "exchange":
+                        result = await session.exchange("show", timeout=20)
+                        self.assertTrue(result.prompt_returned)
+                    else:
+                        await getattr(session, operation)(timeout=20)
+                self.assertEqual(probes[:2], [3, 6])
+                self.assertEqual(len(probes), 2)
+                self.assertEqual(set(fake.line_endings), {JUNOS_PROFILE.line_ending})
+
+    async def test_common_idle_probe_disconnect_keeps_each_flows_recovery_policy(self):
+        for operation in ("enter_command_prompt", "exchange"):
+            with self.subTest(operation=operation):
+                probes = []
+                prompt = "root@router# "
+
+                def respond(fake, content):
+                    if content == "":
+                        probes.append(clock.time())
+                        if len(probes) == 1:
+                            fake.connected = False
+                            raise ConnectionError("idle probe disconnected")
+                        fake.chunks.append(prompt)
+
+                async def reconnect():
+                    fake.connected = True
+                    fake.chunks.clear()
+                    fake.chunks.append(prompt)
+
+                fake = ScriptedTelnet(on_write=respond)
+                fake.reconnect_async = AsyncMock(side_effect=reconnect)
+                session = make_session(fake, JUNOS_PROFILE)
+                session.NUDGE_INTERVAL = 3
+                with exchange_clock(session) as clock:
+                    if operation == "exchange":
+                        result = await session.exchange("show", timeout=20)
+                        self.assertTrue(result.disconnected)
+                        self.assertTrue(result.restore_required)
+                        self.assertFalse(result.timed_out)
+                        fake.reconnect_async.assert_not_awaited()
+                        self.assertEqual(fake.writes, ["show", ""])
+                    else:
+                        await getattr(session, operation)(timeout=20)
+                        fake.reconnect_async.assert_awaited_once_with()
+                self.assertEqual(probes[0], 3)
+
+    async def test_drain_residual_never_sends_idle_probes(self):
         fake = ScriptedTelnet()
-        fake.enqueue("root@router> ")
         session = make_session(fake, JUNOS_PROFILE)
-
-        with self.assertRaises(TimeoutError):
-            await session.wait_for_boot(timeout=0.05)
+        session.DRAIN_MAX = 10
+        session.DRAIN_QUIET = 20
+        with exchange_clock(session) as clock:
+            output = await session.drain_residual()
+        self.assertEqual(clock.time(), 10)
+        self.assertEqual(output, "")
+        self.assertEqual(fake.writes, [])
 
     async def test_enter_command_prompt_from_login(self):
         """验证 login→password→shell→exec→config 状态迁移。"""
@@ -204,6 +448,77 @@ class ConsoleSessionTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(fake.writes, ["root", "admin123", "cli", "configure"])
         self.assertEqual(set(fake.line_endings), {b"\n"})
+
+    async def test_login_handles_split_prompts_and_background_logs_with_all_line_endings(self):
+        for newline in ("\r", "\n", "\r\n"):
+            with self.subTest(newline=newline):
+                fake = ScriptedTelnet(on_write=junos_device)
+                fake.enqueue("router login:" + newline, size=2)
+                fake.enqueue(("Auto Image Upgrade: checking image" + newline) * 100, size=200)
+                session = make_session(fake, JUNOS_PROFILE)
+
+                await session.enter_command_prompt(timeout=2)
+
+                self.assertEqual(fake.writes, ["root", "admin123", "cli", "configure"])
+
+    async def test_login_reconnect_discards_old_partial_prompt(self):
+        fake = ScriptedTelnet()
+        fake.read_available = AsyncMock(side_effect=[
+            "root@route", ConnectionError("connection lost"), "r# ", "", "\nroot@router# "
+        ])
+        fake.reconnect_async = AsyncMock()
+        session = make_session(fake, JUNOS_PROFILE)
+        session.NUDGE_INTERVAL = .001
+
+        await session.enter_command_prompt(timeout=1)
+
+        fake.reconnect_async.assert_awaited_once_with()
+        # 新连接的 r# 不能与旧连接的 root@route 拼成有效配置提示符。
+        self.assertEqual(fake.writes, [""])
+
+    async def test_login_recovers_when_idle_probe_write_disconnects(self):
+        def respond(fake, content):
+            if content == "":
+                fake.connected = False
+                raise ConnectionError("probe write disconnected")
+            junos_device(fake, content)
+
+        fake = ScriptedTelnet(on_write=respond)
+        fake.reconnect_async = AsyncMock(wraps=fake.reconnect_async)
+        session = make_session(fake, JUNOS_PROFILE)
+        session.NUDGE_INTERVAL = .001
+
+        await session.enter_command_prompt(timeout=1)
+
+        fake.reconnect_async.assert_awaited_once_with()
+        self.assertEqual(fake.writes, ["", "root", "admin123", "cli", "configure"])
+
+    async def test_login_limits_reconnections(self):
+        fake = ScriptedTelnet()
+        fake.read_available = AsyncMock(side_effect=ConnectionError("still disconnected"))
+        fake.reconnect_async = AsyncMock()
+        session = make_session(fake, JUNOS_PROFILE)
+
+        with self.assertRaises(ConnectionError):
+            await session.enter_command_prompt(timeout=1)
+
+        self.assertEqual(fake.reconnect_async.await_count, session.MAX_RECOVERIES)
+
+    async def test_command_read_disconnect_preserves_output_without_reconnect_or_resend(self):
+        fake = ScriptedTelnet()
+        fake.read_available = AsyncMock(side_effect=["partial output", ConnectionError("connection lost")])
+        fake.reconnect_async = AsyncMock()
+        session = make_session(fake, JUNOS_PROFILE)
+
+        result = await session.exchange("commit")
+
+        self.assertEqual(result.output, "partial output")
+        self.assertTrue(result.sent)
+        self.assertTrue(result.disconnected)
+        self.assertTrue(result.restore_required)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(fake.writes, ["commit"])
+        fake.reconnect_async.assert_not_called()
 
     async def test_exchange_returns_prompt_without_extra_write(self):
         """验证命令交换只写一次且能识别提示符。"""
@@ -227,6 +542,356 @@ class ConsoleSessionTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.restore_required)
         self.assertEqual(result.prompt_name, "login")
         self.assertFalse(result.prompt_returned)
+
+    async def test_unlimited_exchange_keeps_probing_until_prompt_arrives(self):
+        for explicit_none in (False, True):
+            with self.subTest(explicit_none=explicit_none):
+                probes = []
+
+                def respond_after_long_silence(fake, content):
+                    if not content:
+                        probes.append(clock.time())
+                        if clock.time() >= 600:
+                            fake.enqueue("root@router# ", size=100)
+
+                fake = ScriptedTelnet(on_write=respond_after_long_silence)
+                session = make_session(fake, JUNOS_PROFILE)
+                with exchange_clock(session) as clock:
+                    kwargs = {"timeout": None} if explicit_none else {}
+                    result = await session.exchange("show", **kwargs)
+                self.assertGreaterEqual(clock.time(), 600)
+                self.assertEqual(probes, list(range(3, 601, 3)))
+                self.assertTrue(result.prompt_returned)
+                self.assertFalse(result.timed_out)
+                self.assertTrue(result.sent)
+                self.assertEqual(fake.writes.count("show"), 1)
+
+    async def test_unlimited_exchange_propagates_external_cancellation(self):
+        fake = ScriptedTelnet()
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def hang():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        fake.read_available = AsyncMock(side_effect=hang)
+        task = asyncio.create_task(make_session(fake, JUNOS_PROFILE).exchange("commit"))
+        await started.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(fake.writes, ["commit"])
+
+    async def test_unlimited_exchange_does_not_create_a_timeout_wrapper(self):
+        fake = ScriptedTelnet(on_write=junos_device)
+        session = make_session(fake, JUNOS_PROFILE)
+        with patch("console_session.asyncio.wait_for", side_effect=AssertionError("unexpected timeout")):
+            result = await session.exchange("top")
+        self.assertTrue(result.prompt_returned)
+
+    async def test_readiness_and_recovery_cancel_nested_login_with_one_timeout(self):
+        for operation in ("ensure_ready", "restore"):
+            with self.subTest(operation=operation):
+                fake = ScriptedTelnet(chunks=["router login: "])
+                session = make_session(fake, JUNOS_PROFILE)
+                cancelled = asyncio.Event()
+
+                async def hang(initial_output):
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        cancelled.set()
+
+                session._enter_command_prompt = AsyncMock(side_effect=hang)
+                with patch("console_session.asyncio.wait_for", wraps=asyncio.wait_for) as limited:
+                    with self.assertRaises(TimeoutError):
+                        await getattr(session, operation)(timeout=.02)
+                self.assertTrue(cancelled.is_set())
+                self.assertEqual(limited.await_count, 1)
+                self.assertEqual(session.recovery_generation, 1)
+                self.assertEqual(fake.writes, [])
+
+    async def test_login_timeout_cancels_hung_read(self):
+        fake = ScriptedTelnet()
+        cancelled = asyncio.Event()
+
+        async def hang():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        fake.read_available = AsyncMock(side_effect=hang)
+        session = make_session(fake, JUNOS_PROFILE)
+        with self.assertRaises(TimeoutError):
+            await session.enter_command_prompt(timeout=.01)
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(fake.writes, [])
+
+    async def test_drain_limits_read_count_using_seconds_and_poll_interval(self):
+        fake = ScriptedTelnet()
+        fake.read_available = AsyncMock(return_value="background output\n")
+        session = make_session(fake, JUNOS_PROFILE)
+        session.DRAIN_MAX = 2.5
+        with exchange_clock(session) as clock:
+            output = await session.drain_residual()
+        self.assertEqual(fake.read_available.await_count, 3)
+        self.assertEqual(clock.time(), 3)
+        self.assertEqual(output, "background output\n" * 3)
+        self.assertEqual(fake.writes, [])
+
+    async def test_exchange_expired_budget_never_writes(self):
+        fake = ScriptedTelnet()
+        session = make_session(fake, JUNOS_PROFILE)
+        for timeout in (0, -1):
+            result = await session.exchange("commit", timeout=timeout)
+            self.assertTrue(result.timed_out)
+            self.assertFalse(result.sent)
+        self.assertEqual(fake.writes, [])
+
+    async def test_exchange_restarts_settle_after_prompt_disappears(self):
+        fake = ScriptedTelnet(chunks=[
+            "commit complete\nroot@router# ", "\nwork in progress\n", "", "", "root@router# "
+        ])
+        session = make_session(fake, JUNOS_PROFILE)
+        session.PROMPT_SETTLE = 2
+        with exchange_clock(session) as clock:
+            result = await session.exchange("commit", 10, success_pattern=re.compile("commit complete"))
+        self.assertEqual(clock.time(), 6)
+        self.assertTrue(result.success_seen)
+        self.assertTrue(result.prompt_returned)
+        self.assertIn("work in progress", result.output)
+
+    async def test_exchange_stale_prompt_times_out_and_resumes_nudging(self):
+        fake = ScriptedTelnet(chunks=["root@router# ", "\nstill running\n"])
+        session = make_session(fake, JUNOS_PROFILE)
+        session.PROMPT_SETTLE = 2
+        with exchange_clock(session):
+            result = await session.exchange("show", 5)
+        self.assertTrue(result.timed_out)
+        self.assertFalse(result.prompt_returned)
+        self.assertIsNone(result.prompt_name)
+        self.assertEqual(fake.writes, ["show", ""])
+
+    async def test_exchange_stable_window_cannot_exceed_deadline(self):
+        fake = ScriptedTelnet(chunks=["root@router# "])
+        session = make_session(fake, JUNOS_PROFILE)
+        session.PROMPT_SETTLE = 5
+        with exchange_clock(session) as clock:
+            result = await session.exchange("show", 3)
+        self.assertEqual(clock.time(), 3)
+        self.assertTrue(result.timed_out)
+        self.assertFalse(result.prompt_returned)
+
+    async def test_background_output_does_not_restart_valid_prompt_settle(self):
+        fake = ScriptedTelnet(chunks=[
+            "root@router# \n", "Auto Image Upgrade: busy\n", "Auto Image Upgrade: busy\n"
+        ])
+        session = make_session(fake, JUNOS_PROFILE)
+        session.PROMPT_SETTLE = 2
+        with exchange_clock(session) as clock:
+            result = await session.exchange("show", 4)
+        self.assertEqual(clock.time(), 2)
+        self.assertTrue(result.prompt_returned)
+
+    async def test_exchange_cancels_hung_read(self):
+        fake = ScriptedTelnet()
+        fake.read_available = AsyncMock(side_effect=asyncio.Event().wait)
+        result = await make_session(fake, JUNOS_PROFILE).exchange("show", .02)
+        self.assertTrue(result.timed_out)
+        self.assertTrue(result.sent)
+
+    async def test_exchange_cancels_hung_write_without_reading(self):
+        fake = ScriptedTelnet()
+        fake.read_available = AsyncMock()
+
+        async def hang(*args):
+            await asyncio.Event().wait()
+
+        fake.write_line = AsyncMock(side_effect=hang)
+        result = await make_session(fake, JUNOS_PROFILE).exchange("commit", .02)
+        self.assertTrue(result.timed_out)
+        self.assertFalse(result.sent)
+        fake.read_available.assert_not_called()
+
+    async def test_ready_uses_one_timeout_and_calls_private_restore(self):
+        fake = ScriptedTelnet(chunks=["router login: "])
+        session = make_session(fake, JUNOS_PROFILE)
+        session._restore = AsyncMock()
+        session.restore = AsyncMock(side_effect=AssertionError("nested public timeout"))
+        with patch("console_session.asyncio.wait_for", wraps=asyncio.wait_for) as limited:
+            await session.ensure_ready(timeout=.1)
+        session._restore.assert_awaited_once_with("router login: ")
+        session.restore.assert_not_awaited()
+        self.assertEqual(limited.await_count, 1)
+        self.assertEqual(limited.call_args.kwargs["timeout"], .1)
+
+    async def test_restore_bounds_reconnect_and_increments_generation(self):
+        fake = ScriptedTelnet()
+        fake.connected = False
+        fake.reconnect_async = AsyncMock(side_effect=asyncio.Event().wait)
+        session = make_session(fake, JUNOS_PROFILE)
+        before = session.recovery_generation
+        with self.assertRaises(TimeoutError):
+            await session.restore(timeout=.02)
+        self.assertGreater(session.recovery_generation, before)
+        self.assertEqual(fake.writes, [])
+
+    async def test_restore_calls_private_login_without_another_timeout(self):
+        fake = ScriptedTelnet()
+        fake.connected = False
+        session = make_session(fake, JUNOS_PROFILE)
+        session._enter_command_prompt = AsyncMock()
+        session.enter_command_prompt = AsyncMock(side_effect=AssertionError("nested public timeout"))
+        with exchange_clock(session) as clock:
+            async def reconnect():
+                await clock.sleep(2)
+                fake.connected = True
+            fake.reconnect_async = reconnect
+            await session.restore(timeout=4)
+        self.assertEqual(clock.time(), 3)
+        session._enter_command_prompt.assert_awaited_once_with("")
+        session.enter_command_prompt.assert_not_awaited()
+
+    async def test_write_and_read_share_one_exchange_timeout(self):
+        fake = ScriptedTelnet()
+        session = make_session(fake, JUNOS_PROFILE)
+        cancelled = asyncio.Event()
+
+        async def slow_write(content, line_ending):
+            fake.writes.append(content)
+            await asyncio.sleep(.02)
+
+        async def slow_read():
+            try:
+                await asyncio.sleep(.02)
+                return "root@router# "
+            finally:
+                cancelled.set()
+
+        fake.write_line = slow_write
+        fake.read_available = AsyncMock(side_effect=slow_read)
+        result = await session.exchange("show", timeout=.03)
+        self.assertTrue(result.sent)
+        self.assertTrue(result.timed_out)
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(fake.writes, ["show"])
+
+    async def test_expired_ready_and_restore_do_not_touch_transport(self):
+        fake = ScriptedTelnet()
+        fake.read_available = AsyncMock()
+        session = make_session(fake, JUNOS_PROFILE)
+        for action in (session.ensure_ready, session.restore, session.enter_command_prompt):
+            with self.assertRaises(TimeoutError):
+                await action(timeout=0)
+        fake.read_available.assert_not_called()
+        self.assertEqual(fake.writes, [])
+
+    async def test_exchange_nudges_silent_device_with_profile_line_ending(self):
+        """验证无回显设备收到空行后返回提示符，且使用厂商换行符。"""
+        for profile, prompt in (
+            (JUNOS_PROFILE, "root@router# "),
+            (CISCO_PROFILE, "RP/0/RP0/CPU0:router(config)# "),
+        ):
+            with self.subTest(profile=profile.name):
+                def respond(fake, content):
+                    if content == "":
+                        fake.chunks.append(prompt)
+
+                fake = ScriptedTelnet(on_write=respond)
+                session = make_session(fake, profile)
+                session.NUDGE_INTERVAL = 3.0
+                with exchange_clock(session):
+                    result = await session.exchange("show", timeout=10)
+
+                self.assertEqual(fake.writes, ["show", ""])
+                self.assertEqual(fake.line_endings, [profile.line_ending] * 2)
+                self.assertTrue(result.sent)
+                self.assertTrue(result.prompt_returned)
+                self.assertFalse(result.timed_out)
+
+    async def test_exchange_repeated_nudges_do_not_extend_timeout(self):
+        """验证持续空读每三秒探测一次，仍在原始截止时间结束。"""
+        writes_at = []
+        fake = ScriptedTelnet(on_write=lambda fake, content: writes_at.append(clock.time()))
+        session = make_session(fake, JUNOS_PROFILE)
+        session.NUDGE_INTERVAL = 3.0
+        with exchange_clock(session) as clock:
+            result = await session.exchange("show", timeout=10)
+
+        self.assertEqual(writes_at, [0, 3, 6, 9])
+        self.assertEqual(fake.writes, ["show", "", "", ""])
+        self.assertEqual(clock.time(), 10)
+        self.assertTrue(result.timed_out)
+        self.assertFalse(result.restore_required)
+
+    async def test_exchange_partial_output_resets_idle_timer(self):
+        """验证部分输出重置静默计时，之后再次静默仍会探测。"""
+        writes_at = []
+        fake = ScriptedTelnet(
+            chunks=["", "", "partial output"],
+            on_write=lambda fake, content: writes_at.append(clock.time()),
+        )
+        session = make_session(fake, JUNOS_PROFILE)
+        session.NUDGE_INTERVAL = 3.0
+        with exchange_clock(session) as clock:
+            result = await session.exchange("show", timeout=9)
+
+        self.assertEqual(writes_at, [0, 5, 8])
+        self.assertEqual(result.output, "partial output")
+        self.assertTrue(result.timed_out)
+
+    async def test_exchange_continuous_output_does_not_nudge(self):
+        """验证持续回显期间不会发送额外空行。"""
+        fake = ScriptedTelnet(chunks=["output\r\n"] * 10)
+        session = make_session(fake, JUNOS_PROFILE)
+        session.NUDGE_INTERVAL = 3.0
+        with exchange_clock(session):
+            result = await session.exchange("show", timeout=10)
+
+        self.assertEqual(fake.writes, ["show"])
+        self.assertTrue(result.timed_out)
+
+    async def test_exchange_prompt_settle_does_not_nudge(self):
+        """验证等待提示符稳定及成功标记时停止空行探测。"""
+        fake = ScriptedTelnet(chunks=["root@router# "])
+        session = make_session(fake, JUNOS_PROFILE)
+        session.NUDGE_INTERVAL = 3.0
+        session.PROMPT_SETTLE = 3.0
+        with exchange_clock(session):
+            result = await session.exchange(
+                "commit", timeout=10, success_pattern=re.compile("commit complete")
+            )
+
+        self.assertEqual(fake.writes, ["commit"])
+        self.assertTrue(result.prompt_returned)
+        self.assertFalse(result.success_seen)
+        self.assertFalse(result.timed_out)
+
+    async def test_exchange_nudge_write_disconnect_requires_restore(self):
+        """验证探测写入断线立即返回恢复状态，保留已有回显。"""
+        def disconnect(fake, content):
+            if content == "":
+                raise ConnectionError("nudge write disconnected")
+
+        fake = ScriptedTelnet(chunks=["partial output"], on_write=disconnect)
+        session = make_session(fake, JUNOS_PROFILE)
+        session.NUDGE_INTERVAL = 3.0
+        with exchange_clock(session) as clock:
+            result = await session.exchange("show", timeout=10)
+
+        self.assertEqual(fake.writes, ["show", ""])
+        self.assertEqual(clock.time(), 3)
+        self.assertEqual(result.output, "partial output")
+        self.assertTrue(result.sent)
+        self.assertTrue(result.disconnected)
+        self.assertTrue(result.restore_required)
+        self.assertFalse(result.timed_out)
 
     async def test_exchange_success_marker_split_across_packets(self):
         """验证成功标记跨包时仍能被识别。"""
@@ -399,64 +1064,6 @@ class ConsoleSessionTest(unittest.IsolatedAsyncioTestCase):
         prompt = session._prompt_kind(text)
 
         self.assertEqual(prompt, "config")
-
-    async def test_split_terminal_lines_handles_mixed_endings(self):
-        """验证 CRLF、LF、CR 都按行拆分。"""
-        lines, pending = _split_terminal_lines("a\r\nb\nc\rd")
-
-        self.assertEqual(lines, ["a", "b", "c"])
-        self.assertEqual(pending, "d")
-
-    async def test_split_terminal_lines_waits_for_split_crlf(self):
-        """验证拆开的 CR/LF 不会被当成两个换行。"""
-        lines, pending = _split_terminal_lines("a\r")
-
-        self.assertEqual(lines, [])
-        self.assertEqual(pending, "a\r")
-
-        lines, pending = _split_terminal_lines(pending + "\nb")
-
-        self.assertEqual(lines, ["a"])
-        self.assertEqual(pending, "b")
-
-    async def test_split_terminal_lines_keeps_incomplete_line(self):
-        """验证没有换行的尾部作为 pending 保留。"""
-        lines, pending = _split_terminal_lines("router log")
-
-        self.assertEqual(lines, [])
-        self.assertEqual(pending, "router log")
-
-    async def test_wait_for_boot_handles_cr_only_login(self):
-        """验证只有 CR 的 login 也能完成启动探测。"""
-        fake = ScriptedTelnet(on_write=boot_device)
-        fake.enqueue("router login:\r")
-        session = make_session(fake, JUNOS_PROFILE)
-
-        output = await session.wait_for_boot(timeout=2)
-
-        self.assertIn("router login:", output)
-
-    async def test_wait_for_boot_handles_crlf_login(self):
-        """验证 CRLF login 也能完成启动探测。"""
-        fake = ScriptedTelnet(on_write=boot_device)
-        fake.enqueue("router login:\r\n")
-        session = make_session(fake, JUNOS_PROFILE)
-
-        output = await session.wait_for_boot(timeout=2)
-
-        self.assertIn("router login:", output)
-
-    async def test_wait_for_boot_with_auto_image_flood(self):
-        """验证持续 Auto Image 输出下仍能完成启动探测。"""
-        fake = ScriptedTelnet(on_write=boot_device)
-        fake.enqueue("router login: ")
-        flood = "Auto Image Upgrade: checking image, continuing\r\n" * 100
-        fake.enqueue(flood, size=200)
-        session = make_session(fake, JUNOS_PROFILE)
-
-        output = await session.wait_for_boot(timeout=2)
-
-        self.assertIn("router login:", output)
 
     async def test_analysis_text_does_not_strip_normal_line_ending_with_command(self):
         """验证普通输出行末尾出现命令文本时不被误删。"""

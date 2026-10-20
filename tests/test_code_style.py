@@ -1,11 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""检查生产代码的方法长度和圈复杂度。
-
-做什么：静态解析 Juniper 与 Telnet 两个文件，统计每个方法的有效代码行数和
-近似圈复杂度。
-为什么：把“方法不超过 50 行、复杂度不要过高”固化成可重复执行的检查。
-"""
+"""检查导入及会话代码的方法长度和圈复杂度，文档与注释不计入代码行。"""
 
 import ast
 import os
@@ -23,13 +18,13 @@ MAX_COMPLEXITY = 10
 
 
 def _count_code_lines(source_lines, node):
-    """统计方法体中的有效代码行。
-
-    做什么：从方法体第一行到结束行，跳过空行和纯注释行。
-    为什么：需求只约束代码行数，注释和空行不应计入。
-    """
+    """统计有效代码行，跳过 docstring、空行和纯注释行。"""
+    first_statement = node.body[0]
+    start = first_statement.lineno - 1
+    if ast.get_docstring(node) is not None:
+        start = first_statement.end_lineno
     count = 0
-    for index in range(node.body[0].lineno - 1, node.end_lineno):
+    for index in range(start, node.end_lineno):
         line = source_lines[index].strip()
         if not line or line.startswith("#"):
             continue
@@ -73,6 +68,17 @@ def _iter_functions(tree):
 
 
 class CodeStyleTest(unittest.TestCase):
+    def test_docstrings_do_not_count_as_code(self):
+        source = 'def example():\n    """Summary.\n' + '    Documentation.\n' * 60
+        source += '    """\n    # Comment.\n    value = 1\n\n    return value\n'
+        function = ast.parse(source).body[0]
+        self.assertEqual(_count_code_lines(source.splitlines(), function), 2)
+
+    def test_methods_without_docstrings_count_the_first_statement(self):
+        source = 'def example():\n    value = 1\n    return value\n'
+        function = ast.parse(source).body[0]
+        self.assertEqual(_count_code_lines(source.splitlines(), function), 2)
+
     def test_source_methods_are_small_and_simple(self):
         """检查方法长度和复杂度。
 

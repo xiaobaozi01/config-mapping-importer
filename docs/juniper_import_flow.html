@@ -587,21 +587,21 @@
     <div class="eyebrow">Current Code Flow</div>
     <h1>Juniper vJunos<br><span class="accent">配置导入代码流转</span></h1>
     <p>
-      从 <code class="inline">import_cfg()</code> 入口，到启动登录、FTP 准备、配置加载、
+      从 <code class="inline">import_cfg()</code> 入口，到识别当前终端状态、FTP 准备、配置加载、
       commit 核实和清理。图中反映当前代码，不包含历史方案。
     </p>
     <div class="chips">
-      <span class="chip"><i class="dot"></i>统一 1800s 总预算</span>
-      <span class="chip"><i class="dot"></i>login + 空行探测</span>
+      <span class="chip"><i class="dot"></i>普通命令不限时，登录恢复单次 300s</span>
+      <span class="chip"><i class="dot"></i>当前模式识别 + 静默空行探测</span>
       <span class="chip"><i class="dot"></i>commit 历史为最终判据</span>
-      <span class="chip"><i class="dot"></i>锁冲突 3 次短重试</span>
+      <span class="chip"><i class="dot"></i>锁冲突最多重试 60 次，间隔 5s</span>
       <span class="chip"><i class="dot"></i>只删第一条 echo</span>
     </div>
   </header>
 
   <nav class="toc">
     <a href="#orchestration">01 总编排</a>
-    <a href="#boot">02 启动与登录</a>
+    <a href="#boot">02 入口与模式切换</a>
     <a href="#exchange">03 命令交换与文本定位</a>
     <a href="#commit">04 Commit 状态机</a>
     <a href="#sequence">05 时序</a>
@@ -611,35 +611,35 @@
     <section class="panel" id="orchestration">
       <h2><span class="num">01</span>总编排：import_cfg</h2>
       <p class="sub">
-        一个总 deadline 贯穿全流程；每一步拿剩余预算，不再按命令设置 30/60/120 秒。
+        导入和初始化不设整体超时；入口模式切换和恢复单次最多 300 秒，历史最多查询 60 次、每次最多 10 秒。
       </p>
 
       <div class="flow">
         <div class="node">
           <span class="tag">入口</span>
           <h3>import_cfg(local_cfg_path)</h3>
-          <p>创建 deadline = now + OPERATION_TIMEOUT（默认 1800s）。finally 中统一 cleanup。</p>
+          <p>直接执行导入流程，不设总超时；异常或外部取消后，finally 中统一 cleanup。</p>
         </div>
         <div class="arrow"></div>
 
         <div class="node console">
           <span class="tag">连接</span>
           <h3>init_telnet_client()</h3>
-          <p>通过父类取得 TelnetClient，并用剩余预算包住连接过程。</p>
+          <p>通过父类取得 TelnetClient，连接过程不再受入口整体超时限制。</p>
         </div>
         <div class="arrow"></div>
 
         <div class="node console">
-          <span class="tag">启动</span>
-          <h3>ConsoleSession.wait_for_boot()</h3>
-          <p>只认 login 提示符；出现候选后发送空行，必须收到探测后的新 login 才返回。</p>
-        </div>
-        <div class="arrow"></div>
-
-        <div class="node console">
-          <span class="tag">登录</span>
+          <span class="tag">当前状态</span>
           <h3>enter_command_prompt()</h3>
-          <p>login → password → shell → cli → configure → config；按 profile 数据驱动。</p>
+          <p>识别 login、password、shell、EXEC 或配置提示符，按需登录和切换；已在配置模式则直接继续，随后 top 返回顶层。</p>
+        </div>
+        <div class="arrow"></div>
+
+        <div class="node commit">
+          <span class="tag">关闭自动升级</span>
+          <h3>_disable_auto_image_upgrade(session)</h3>
+          <p>检查 root 认证后，执行 top 和 delete chassis auto-image-upgrade，单独 commit 并核实历史；成功后再准备 FTP。</p>
         </div>
         <div class="arrow"></div>
 
@@ -659,22 +659,21 @@
         <div class="arrow"></div>
 
         <div class="node">
-          <span class="tag">Prep · Best Effort</span>
-          <h3>_prepare_config(session, deadline)</h3>
-          <p>失败只告警并继续，不阻断最终 load。</p>
+          <span class="tag">Prep</span>
+          <h3>_prepare_config(session)</h3>
+          <p>准备命令必须成功，失败时停止导入并清理。</p>
           <div class="prep-list">
             <div class="prep-item"><code>top</code></div>
-            <div class="prep-item"><code>delete chassis auto-image-upgrade</code></div>
             <div class="prep-item"><code>set chassis fpc 0 pic 0 number-of-ports N</code></div>
             <div class="prep-item"><code>set interfaces &lt;if&gt; ... address 10.0.0.2/24</code></div>
           </div>
-          <p style="margin-top:10px;">需要变更的命令逐条 commit；top 不提交。commit 失败只告警，继续。</p>
+          <p style="margin-top:10px;">准备命令全部执行后统一 commit，并核实提交历史。</p>
         </div>
         <div class="arrow"></div>
 
         <div class="node">
           <span class="tag">Load</span>
-          <h3>_load_config(session, deadline)</h3>
+          <h3>_load_config(session)</h3>
           <p>发送 <code class="inline">load override ftp://...</code>，最多恢复后重试 3 次。</p>
           <p style="margin-top:4px;">成功只认 <code class="inline">load complete</code>；非零 error count 直接失败；无 complete 则失败或恢复。</p>
         </div>
@@ -682,7 +681,7 @@
 
         <div class="node commit">
           <span class="tag">Commit · Final</span>
-          <h3>_commit_and_verify(session, "final", timeout=remaining)</h3>
+          <h3>_commit_and_verify(session, "final")</h3>
           <p>生成独立 UUID；commit complete 只是候选成功，最终以 show system commit 最新已完成记录为准。</p>
         </div>
         <div class="arrow"></div>
@@ -695,33 +694,33 @@
       </div>
 
       <div class="callout">
-        <b>分支：init_device()</b> — 不走 FTP；启动登录后执行 required 的
-        <code class="inline">top</code>、<code class="inline">delete chassis auto-image-upgrade</code>、
+        <b>分支：init_device()</b> — 不走 FTP；进入配置顶层和 root 认证检查后，先单独关闭自动升级并核实提交，再执行
+        <code class="inline">top</code>、
         <code class="inline">set system host-name</code>、
         <code class="inline">set chassis fpc 0 pic 0 number-of-ports 40</code>。
-        这些命令失败会直接向上抛出，不做 best-effort。
+        主机名和端口配置统一提交；各阶段失败会直接向上抛出。
       </div>
     </section>
 
     <section class="panel" id="boot">
-      <h2><span class="num">02</span>启动与登录</h2>
+      <h2><span class="num">02</span>入口与模式切换</h2>
       <p class="sub">
-        FIPS 判断已移除；启动完成由 login 提示符和空行探测决定。
+        import_cfg 可以在设备启动后反复调用，从当前提示符开始处理，不要求设备重新启动或返回 login。
       </p>
 
       <div class="two-col">
         <div class="card">
-          <h3>wait_for_boot()</h3>
+          <h3>从任意已支持模式进入</h3>
           <ol class="steps">
-            <li><span class="n">1</span><span>读取 chunk，累计到 <code class="inline">state.output</code>。</span></li>
-            <li><span class="n">2</span><span><code class="inline">_prompt_kind()</code> 只从最后一条有效行识别提示符。</span></li>
-            <li><span class="n">3</span><span>候选提示符必须属于 <code class="inline">boot_prompts</code>；Juniper 只配了 <code class="inline">login</code>。</span></li>
-            <li><span class="n">4</span><span>稳定窗口满足后，清空 <code class="inline">pending_line</code>，发送一个空行。</span></li>
-            <li><span class="n">5</span><span>只检查 probe 之后的新输出；再次出现 login 才返回。</span></li>
-            <li><span class="n">6</span><span>超时则 TimeoutError，交给上层失败/恢复。</span></li>
+            <li><span class="n">1</span><span>读取 chunk，累计到会话的 <code class="inline">_buffer</code>，跨包提示符继续拼接。</span></li>
+            <li><span class="n">2</span><span><code class="inline">_expect()</code> 从 profile 的全部提示符规则识别当前状态。</span></li>
+            <li><span class="n">3</span><span>未收到提示符且持续静默时，每 3 秒发送空行请求当前提示符。</span></li>
+            <li><span class="n">4</span><span>按当前状态发送认证或模式命令，已经在配置模式时直接返回。</span></li>
+            <li><span class="n">5</span><span>业务层先执行 top，确保 root 认证查询和后续配置从顶层开始。</span></li>
+            <li><span class="n">6</span><span>模式切换入口单次限时 300 秒，内部重连不重新包装超时。</span></li>
           </ol>
           <div class="callout">
-            <b>为什么探测：</b>启动日志里的 login 片段、旧提示符或未响应的 getty 不能证明 console 已可交互。
+            <b>统一入口：</b>导入和初始化直接从当前提示符进入；NUDGE_INTERVAL 统一控制登录和命令交换的静默探测间隔。
           </div>
         </div>
 
@@ -756,14 +755,23 @@
       </p>
 
       <div class="card" style="margin-bottom:12px;">
-        <h3>exchange() 的读取循环</h3>
+        <h3>会话缓冲区与命令交换</h3>
+        <p><code class="inline">ConsoleSession._buffer</code> 保存尚未消费的原始数据。
+          <code class="inline">_read()</code> 统一追加数据，<code class="inline">_expect()</code> 等待目标提示符并返回名称、原始边界和稳定起点，
+          <code class="inline">_consume()</code> 取走本次处理的前缀，剩余数据保留给下一阶段。
+          是否消费数据由调用方决定；命令回显过滤、成功标记、宽限期和恢复状态由
+          <code class="inline">_wait_command_result()</code> 判断，通用等待函数不接收命令或成功标记参数。
+          启动、登录和命令交换共用等待逻辑的静默探测：
+          无提示符且连续静默 3 秒时发送回车，持续有输出或等待提示符稳定时不探测。
+          清理残留回显时不启用探测；启动流程先消费候选提示符和探测前的数据，再回车等待新的响应。
+          同一会话按顺序执行操作，每次返回的结果都是独立快照。</p>
         <ol class="steps">
           <li><span class="n">1</span><span><code class="inline">ensure_ready()</code>：先 drain 残留；若停在非 command prompt 或断线，先 restore。</span></li>
           <li><span class="n">2</span><span>发送一次完整命令行；<code class="inline">result.sent</code> 标记是否真正写出。</span></li>
-          <li><span class="n">3</span><span>持续读取 chunk，累计到 <code class="inline">result.output</code>，不做隐式丢弃。</span></li>
+          <li><span class="n">3</span><span>持续读取 chunk，追加到会话缓冲区，不向业务流程传递可变读取状态。</span></li>
           <li><span class="n">4</span><span>每次新 chunk 都检查期望提示符、非期望提示符和 success pattern。</span></li>
           <li><span class="n">5</span><span>提示符出现后至少等 <code class="inline">PROMPT_SETTLE</code>；有 success pattern 时再给宽限。</span></li>
-          <li><span class="n">6</span><span>返回 <code class="inline">ConsoleResult</code>：output、sent、prompt、restore、success、timeout。</span></li>
+          <li><span class="n">6</span><span>消费到匹配边界并返回 <code class="inline">ConsoleResult</code>；后续日志保留在缓冲区，超时或断线的部分输出仍交给调用方。</span></li>
         </ol>
       </div>
 
@@ -814,8 +822,8 @@
       <div class="commit-tree">
         <div class="node commit">
           <span class="tag">Start</span>
-          <h3>生成 comment = cfg-import-&lt;UUID&gt;，deadline = now + timeout</h3>
-          <p>timeout 必填，调用方传总预算剩余时间；timeout=0 时立即未确认，不会等待 1800s。</p>
+          <h3>生成 comment = cfg-import-&lt;UUID&gt;</h3>
+          <p>提交命令不限时等待提示符、会话丢失或外部取消；之后按固定次数核实历史，每次查询独立限时。</p>
         </div>
 
         <div class="commit-branches">
@@ -826,8 +834,8 @@
           </div>
           <div class="branch">
             <b>锁拒绝</b>
-            <p>明确 locked 且 prompt 已回。首次 + 3 次重试，每 5s。</p>
-            <span class="result warn">耗尽 → JunosCommandError</span>
+            <p>明确 locked 且 prompt 已回后，每隔 5s 重试，首次提交之外最多 60 次；使用同一 comment，恢复不重置次数。</p>
+            <span class="result warn">次数耗尽 → JunosCommandError，保留最后一次锁错误原文</span>
           </div>
           <div class="branch">
             <b>明确失败</b>
@@ -852,15 +860,16 @@
             <div class="branch"><b>match</b><p>最新已完成 comment == UUID。</p><span class="result">成功</span></div>
             <div class="branch"><b>mismatch</b><p>可读，但不是本次。</p><span class="result bad">验证失败</span></div>
             <div class="branch"><b>no records / unreadable</b><p>无法确认。</p><span class="result warn">未确认</span></div>
-            <div class="branch"><b>prep commit</b><p>失败只告警，继续最终 load。</p><span class="result warn">best-effort</span></div>
+            <div class="branch"><b>prep commit</b><p>同样必须核实成功。</p><span class="result bad">失败则停止导入</span></div>
           </div>
         </div>
       </div>
 
       <div class="callout">
-        <b>总预算与 commit：</b>commit 不占用独立的 120/300 秒；它只拿
-        <code class="inline">_remaining(deadline)</code>。锁冲突用 3 次/5 秒的短重试，
-        持久锁快速失败，不再等 300 秒。
+        <b>重试次数与 commit：</b>提交本身不设超时；历史最多查询 60 次，间隔 5 秒，每次查询最多 10 秒，
+        包含该次就绪检查。锁冲突最多重试 60 次，间隔 5 秒；恢复不重置次数，最后一次失败后不再等待。
+        不再传递总截止时间，实际总耗时包含命令和恢复耗时，可能超过 300 秒。
+        已发送的提交仍不限时等待，结果不明时只恢复并核实历史，不重复提交。
       </div>
     </section>
 
@@ -881,25 +890,25 @@
           <span class="seq-step">02</span>
           <span class="actor manager">Manager</span><span class="seq-arrow">→</span>
           <span class="actor console">Console</span>
-          <span class="seq-msg">wait_for_boot(remaining)</span>
+          <span class="seq-msg">enter_command_prompt()</span>
         </div>
         <div class="seq-row">
           <span class="seq-step">03</span>
           <span class="actor console">Console</span><span class="seq-arrow">→</span>
           <span class="actor device">Junos</span>
-          <span class="seq-msg">read boot output；login 候选 → 空行探测 → 新 login</span>
+          <span class="seq-msg">读取当前提示符；静默时每 3 秒发送空行探测</span>
         </div>
         <div class="seq-row">
           <span class="seq-step">04</span>
           <span class="actor manager">Manager</span><span class="seq-arrow">→</span>
           <span class="actor console">Console</span>
-          <span class="seq-msg">enter_command_prompt(boot_output, remaining)</span>
+          <span class="seq-msg">按需登录并切换至配置模式；已在配置模式则直接继续</span>
         </div>
         <div class="seq-row">
           <span class="seq-step">05</span>
           <span class="actor console">Console</span><span class="seq-arrow">→</span>
           <span class="actor device">Junos</span>
-          <span class="seq-msg">root → admin123 → cli → configure → config</span>
+          <span class="seq-msg">top → 检查 root 认证 → 单独提交关闭自动升级并核实</span>
         </div>
         <div class="seq-row">
           <span class="seq-step">06</span>
@@ -911,7 +920,7 @@
           <span class="seq-step">07</span>
           <span class="actor manager">Manager</span><span class="seq-arrow">→</span>
           <span class="actor console">Console</span>
-          <span class="seq-msg">_prepare_config：top / delete auto-image / ports / IP；逐条 best-effort commit</span>
+          <span class="seq-msg">_prepare_config：top / ports / IP；统一 commit 并核实历史</span>
         </div>
         <div class="seq-row">
           <span class="seq-step">08</span>
