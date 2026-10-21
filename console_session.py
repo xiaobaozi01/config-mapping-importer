@@ -243,8 +243,14 @@ class ConsoleSession:
         timeout: float | None = None,
         prompt_names: Iterable[str] | None = None,
         success_pattern: re.Pattern[str] | None = None,
+        *,
+        idle_probe: bool = True,
+        failure_patterns: tuple[re.Pattern[str], ...] = (),
     ) -> ConsoleResult:
-        """发送一次命令并消费本次结果；None 表示发送和读取均不限时。"""
+        """发送一次命令；可关闭空行探测或遇到阶段错误时提前结束等待。
+
+        timeout=None 保持不限时；新增关键字参数默认不改变既有调用行为。
+        """
         result = ConsoleResult()
         if timeout is not None and timeout <= 0:
             result.timed_out = True
@@ -252,7 +258,9 @@ class ConsoleSession:
         expected_prompts = set(prompt_names) if prompt_names else {self._profile.command_prompt}
         log.info("Console execute: %s", command)
         try:
-            operation = self._exchange_once(command, result, expected_prompts, success_pattern)
+            operation = self._exchange_once(
+                command, result, expected_prompts, success_pattern, idle_probe, failure_patterns,
+            )
             if timeout is None:
                 await operation
             else:
@@ -274,12 +282,16 @@ class ConsoleSession:
         result: ConsoleResult,
         expected_prompts: set[str],
         success_pattern: re.Pattern[str] | None,
+        idle_probe: bool,
+        failure_patterns: tuple[re.Pattern[str], ...],
     ) -> None:
         """发送耗时计入交换预算；断线只返回结果，不恢复或重发命令。"""
         if not await self._send_exchange(command, result):
             return
         try:
-            response = await self._wait_command_result(expected_prompts, command, success_pattern)
+            response = await self._wait_command_result(
+                expected_prompts, command, success_pattern, idle_probe, failure_patterns,
+            )
             result.output = response.output
             result.prompt_name = response.prompt_name
             result.prompt_returned = response.prompt_returned
@@ -290,7 +302,8 @@ class ConsoleSession:
             result.prompt_name = self._prompt_kind(result.output)
             result.success_seen = self._success_seen(result.output, command, success_pattern)
             result.restore_required = result.disconnected = True
-            log.warning("Console exchange failed: profile=%s command=%s detail=%s", self._profile.name, command, exc)
+            log.warning("Console exchange failed: profile=%s command=%s detail=%s",
+                        self._profile.name, command, exc)
 
     async def _send_exchange(self, command: str, result: ConsoleResult) -> bool:
         """发送命令并记录发送状态。
@@ -313,11 +326,15 @@ class ConsoleSession:
         prompts: set[str],
         command: str,
         success_pattern: re.Pattern[str] | None,
+        idle_probe: bool,
+        failure_patterns: tuple[re.Pattern[str], ...],
     ) -> ConsoleResult:
         """命令交换独有的回显分析、成功标记宽限期和会话丢失判断。"""
         success_seen = False
         while True:
-            match = await self._expect(prompts, settle=self.PROMPT_SETTLE)
+            match = await self._expect(
+                prompts, settle=self.PROMPT_SETTLE, idle_probe=idle_probe, failure_patterns=failure_patterns,
+            )
             success_seen = success_seen or self._success_seen(self._buffer, command, success_pattern)
             elapsed = asyncio.get_running_loop().time() - match.since
             ready = success_pattern is None or success_seen or elapsed >= self.PROMPT_SETTLE * 2
@@ -517,13 +534,19 @@ class ConsoleSession:
         """只在本次输出的有效文本中查找成功标记。"""
         return pattern is not None and bool(pattern.search(self.analysis_text(output, command)))
 
-    async def _expect(self, prompts: set[str], *, settle: float = 0, first_prompt: bool = False) -> _PromptMatch:
+    async def _expect(
+        self, prompts: set[str], *, settle: float = 0,
+        first_prompt: bool = False, idle_probe: bool = True,
+        failure_patterns: tuple[re.Pattern[str], ...] = (),
+    ) -> _PromptMatch:
         """等待提示符并返回匹配边界，不消费数据；由调用方决定结果含义和消费时机。"""
         loop = asyncio.get_running_loop()
         self._last_data_at = self._last_probe_at = loop.time()
         if not self._buffer:
             await self._read()
         while True:
+            if self._failure_seen(failure_patterns):
+                return _PromptMatch("command_error", len(self._buffer), loop.time())
             prompt, end = self._find_prompt(prompts, first=first_prompt)
             now = loop.time()
             if prompt != self._last_prompt:
@@ -532,7 +555,7 @@ class ConsoleSession:
             if prompt is not None:
                 if prompt not in prompts or now - self._prompt_since >= settle:
                     return _PromptMatch(prompt, end, self._prompt_since)
-            if prompt is None:
+            if prompt is None and idle_probe:
                 await self._probe_if_idle()
             await asyncio.sleep(self.READ_INTERVAL)
             await self._read()
@@ -544,6 +567,12 @@ class ConsoleSession:
             return
         self._last_probe_at = now
         await self._telnet.write_line("", self._profile.line_ending)
+
+    def _failure_seen(self, patterns: tuple[re.Pattern[str], ...]) -> bool:
+        """显式阶段错误可以结束等待，不依赖设备再返回提示符。"""
+        return bool(patterns) and self.find_explicit_error(
+            normalize_terminal_text(self._buffer), patterns=patterns,
+        ) is not None
 
     async def _reconnect(self) -> None:
         """重连使旧连接的未消费数据失效，恢复代次先递增。"""

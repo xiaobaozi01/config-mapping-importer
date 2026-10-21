@@ -830,6 +830,28 @@ class ConsoleSessionTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.timed_out)
         self.assertFalse(result.restore_required)
 
+    async def test_idle_probe_can_be_disabled_for_one_exchange(self):
+        """禁用仅作用于本次交换；后续命令恢复默认探测。"""
+        fake = ScriptedTelnet()
+        session = make_session(fake, JUNOS_PROFILE)
+        session.NUDGE_INTERVAL = 3
+        with exchange_clock(session):
+            result = await session.exchange("commit", timeout=10, idle_probe=False)
+        self.assertTrue(result.timed_out)
+        self.assertEqual(fake.writes, ["commit"])
+        with exchange_clock(session):
+            await session.exchange("show", timeout=4)
+        self.assertEqual(fake.writes, ["commit", "show", ""])
+
+    async def test_disabled_probe_is_preserved_through_delayed_result(self):
+        fake = ScriptedTelnet(chunks=[""] * 6 + ["root@router# "])
+        session = make_session(fake, JUNOS_PROFILE)
+        session.NUDGE_INTERVAL = 3
+        with exchange_clock(session):
+            result = await session.exchange("commit", timeout=10, idle_probe=False)
+        self.assertTrue(result.prompt_returned)
+        self.assertEqual(fake.writes, ["commit"])
+
     async def test_exchange_partial_output_resets_idle_timer(self):
         """验证部分输出重置静默计时，之后再次静默仍会探测。"""
         writes_at = []

@@ -158,6 +158,7 @@ class FakeCiscoTelnet:
     def __init__(self):
         self.chunks = []
         self.writes = []
+        self.line_endings = []
         self.connected = True
         self.current_prompt = ROOT_USERNAME
         self.secret_count = 0
@@ -165,6 +166,12 @@ class FakeCiscoTelnet:
         self.history_override = None
         self.history_override_queries = 0
         self.confirm_commit = False
+        self.confirm_prompt = CONFIRM
+        self.confirmation_pending = False
+        self.repeat_confirmation = False
+        self.cancel_count = 0
+        self.extra_history_labels = []
+        self.history_output = None
         self.commit_lost_at = 0
         self.commit_attempt_count = 0
         self.load_unconfirmed_count = 0
@@ -194,6 +201,7 @@ class FakeCiscoTelnet:
         if isinstance(content, bytes):
             content = content.decode("utf-8", errors="replace")
         self.writes.append(content)
+        self.line_endings.append(line_ending)
         self._handle(content.strip())
 
     async def telnet_write(self, content, sleep_time=0):
@@ -216,6 +224,11 @@ class FakeCiscoTelnet:
 
     def _handle(self, text):
         if text == "":
+            if self.confirmation_pending:
+                self.confirmation_pending = False
+                self.cancel_count += 1
+                self.current_prompt = CONFIG
+                self.enqueue("\r\nCommit cancelled\r\n")
             self.enqueue(self.current_prompt)
             return
         if text == "root":
@@ -241,6 +254,11 @@ class FakeCiscoTelnet:
             self.enqueue(EXEC)
             return
         if text == "yes":
+            if self.repeat_confirmation:
+                self.enqueue("\r\n" + self.confirm_prompt)
+                return
+            self.confirmation_pending = False
+            self.enqueue("\r\n")
             if self.commit_after_yes_error:
                 self.enqueue(self.commit_after_yes_error + "\r\n")
             else:
@@ -287,14 +305,15 @@ class FakeCiscoTelnet:
                 self.enqueue(ROOT_USERNAME)
                 return
             if self.confirm_commit:
-                self.current_prompt = CONFIRM
-                self.enqueue(CONFIRM)
+                self.confirmation_pending = True
+                self.current_prompt = self.confirm_prompt
+                self.enqueue(self.confirm_prompt)
             else:
                 self._record_commit()
                 self.current_prompt = CONFIG
                 self.enqueue(CONFIG)
             return
-        if text == "do show configuration commit list":
+        if text == "do show configuration commit list 20":
             self.enqueue(text + "\r\n")
             label = self.history_label
             if (
@@ -304,7 +323,11 @@ class FakeCiscoTelnet:
                 label = self.history_override
                 self.history_override_queries -= 1
             self.enqueue("SNo. Label/ID User Line Client Time Stamp\r\n")
-            self.enqueue(f"1 {label} root con0_RPs0_C CLI 00:00:00 UTC Mon Jan 01 2024\r\n")
+            if self.history_output is not None:
+                self.enqueue(self.history_output)
+            else:
+                for index, item in enumerate([*self.extra_history_labels, label], 1):
+                    self.enqueue(f"{index} {item} root con0_RPs0_C CLI 00:00:00 UTC Mon Jan 01 2024\r\n")
             self.current_prompt = CONFIG
             self.enqueue(CONFIG)
             return
@@ -345,6 +368,234 @@ def make_manager(fake):
 
 
 class CiscoImportScenarioTest(unittest.IsolatedAsyncioTestCase):
+    def ready_commit(self, fake):
+        fake.chunks = [CONFIG]
+        fake.current_prompt = CONFIG
+        manager = make_manager(fake)
+        manager.COMMIT_EXCHANGE_TIMEOUT = .3
+        return manager, manager._console_session(fake)
+
+    def assert_commit_stopped(self, fake, yes_count=0):
+        self.assertNotIn("", fake.writes)
+        self.assertEqual(fake.writes.count("yes"), yes_count)
+        self.assertNotIn("do show configuration commit list 20", fake.writes)
+        self.assertEqual(sum(item.startswith("commit label ") for item in fake.writes), 1)
+        self.assertEqual(fake.cancel_count, 0)
+
+    async def test_blank_line_accepts_default_no_in_fake_terminal(self):
+        fake = FakeCiscoTelnet()
+        fake.confirm_commit = True
+        await fake.write_line("commit label example replace")
+        await fake.write_line("")
+        self.assertEqual(fake.cancel_count, 1)
+        self.assertEqual(fake.current_prompt, CONFIG)
+        self.assertEqual(fake.committed_targets, [])
+
+    async def test_fixed_confirmation_commits_once_with_outer_whitespace(self):
+        variants = (
+            CONFIRM,
+            CONFIRM.strip(),
+            "\t" + CONFIRM + "\t",
+        )
+        for prompt in variants:
+            with self.subTest(prompt=prompt):
+                fake = FakeCiscoTelnet()
+                fake.confirm_commit = True
+                fake.confirm_prompt = prompt
+                manager, session = self.ready_commit(fake)
+                await manager._commit_and_verify(session, "variant")
+                self.assertEqual(fake.writes.count("yes"), 1)
+                self.assertNotIn("", fake.writes)
+                self.assertEqual(fake.cancel_count, 0)
+                self.assertEqual(len(fake.committed_targets), 1)
+
+    async def test_confirmation_with_ansi_chunks_and_background_output(self):
+        fake = FakeCiscoTelnet()
+        fake.confirm_commit = True
+        enqueue = fake.enqueue
+
+        def fragmented(text):
+            if text != CONFIRM:
+                enqueue(text)
+                return
+            output = (
+                "%MGBL-CONFIG-6-DB_COMMIT : background activity\r\n"
+                "\x1b[33mDo you wish to proceed? [no]: \x1b[0m"
+            )
+            for char in output:
+                enqueue(char)
+
+        fake.enqueue = fragmented
+        manager, session = self.ready_commit(fake)
+        await manager._commit_and_verify(session, "fragmented")
+        self.assertEqual(fake.writes.count("yes"), 1)
+        self.assertNotIn("", fake.writes)
+
+    async def test_unmatched_confirmation_times_out_before_yes_or_history(self):
+        for prompt in ("Proceed with replacement? [yes/no]: ", "Do you wish to proceed? [cancel]: "):
+            with self.subTest(prompt=prompt):
+                fake = FakeCiscoTelnet()
+                fake.confirm_commit = True
+                fake.confirm_prompt = prompt
+                manager, session = self.ready_commit(fake)
+                manager.COMMIT_EXCHANGE_TIMEOUT = .07
+                with self.assertRaisesRegex(cisco.CiscoResultUnconfirmed, "timed out") as caught:
+                    await manager._commit_and_verify(session, "unknown")
+                self.assertIn("stage=unknown", str(caught.exception))
+                self.assertIn(prompt.strip(), str(caught.exception))
+                self.assert_commit_stopped(fake)
+
+    async def test_repeated_confirmation_sends_yes_only_once(self):
+        fake = FakeCiscoTelnet()
+        fake.confirm_commit = True
+        fake.repeat_confirmation = True
+        manager, session = self.ready_commit(fake)
+        with self.assertRaisesRegex(cisco.CiscoResultUnconfirmed, "repeated confirmation"):
+            await manager._commit_and_verify(session, "repeated")
+        self.assert_commit_stopped(fake, yes_count=1)
+
+    async def test_unrecognized_interaction_times_out_without_probe_or_history(self):
+        fake = FakeCiscoTelnet()
+        fake.confirm_commit = True
+        fake.confirm_prompt = "Continue now: "
+        manager, session = self.ready_commit(fake)
+        manager.COMMIT_EXCHANGE_TIMEOUT = .07
+        session.NUDGE_INTERVAL = .01
+        with self.assertRaisesRegex(cisco.CiscoResultUnconfirmed, "timed out") as caught:
+            await manager._commit_and_verify(session, "silent")
+        self.assertIn("Continue now:", str(caught.exception))
+        self.assert_commit_stopped(fake)
+
+    async def test_wait_after_yes_is_bounded_and_never_queries_pending_commit(self):
+        fake = FakeCiscoTelnet()
+        fake.confirm_commit = True
+        handle = fake._handle
+
+        def slow_apply(text):
+            if text == "yes":
+                fake.enqueue("\r\nApplying configuration...\r\n")
+            else:
+                handle(text)
+
+        fake._handle = slow_apply
+        manager, session = self.ready_commit(fake)
+        manager.COMMIT_EXCHANGE_TIMEOUT = .07
+        session.NUDGE_INTERVAL = .01
+        with self.assertRaisesRegex(cisco.CiscoResultUnconfirmed, "command='yes'"):
+            await manager._commit_and_verify(session, "applying")
+        self.assert_commit_stopped(fake, yes_count=1)
+
+    async def test_explicit_commit_failure_does_not_wait_for_a_prompt(self):
+        fake = FakeCiscoTelnet()
+        fake._handle = lambda text: fake.enqueue("% Failed to commit one or more configuration items\r\n")
+        manager, session = self.ready_commit(fake)
+        with self.assertRaisesRegex(cisco.CiscoCommandError, "Failed to commit"):
+            await asyncio.wait_for(manager._commit_and_verify(session, "rejected"), timeout=.1)
+        self.assert_commit_stopped(fake)
+
+    async def test_commit_timeout_budgets_are_separate_from_history(self):
+        fake = FakeCiscoTelnet()
+        fake.confirm_commit = True
+        manager, session = self.ready_commit(fake)
+        manager.COMMIT_EXCHANGE_TIMEOUT = 300
+        with patch.object(session, "exchange", wraps=session.exchange) as exchange:
+            await manager._commit_and_verify(session, "budgets")
+        commit_calls = [call for call in exchange.await_args_list
+                        if call.args[0].startswith("commit label ") or call.args[0] == "yes"]
+        self.assertEqual(len(commit_calls), 2)
+        self.assertTrue(all(call.kwargs["timeout"] == 300 for call in commit_calls))
+        self.assertTrue(all(call.kwargs["idle_probe"] is False for call in commit_calls))
+
+    async def test_history_matches_label_in_second_record(self):
+        fake = FakeCiscoTelnet()
+        fake.extra_history_labels = ["another-commit"]
+        manager, session = self.ready_commit(fake)
+        label = await manager._commit_and_verify(session, "second-row")
+        self.assertEqual(label, fake.history_label)
+        self.assertEqual(fake.writes.count("do show configuration commit list 20"), 1)
+
+    async def test_disconnect_after_commit_or_yes_recovers_without_resubmitting(self):
+        for confirmed in (False, True):
+            with self.subTest(confirmed=confirmed):
+                fake = FakeCiscoTelnet()
+                fake.confirm_commit = confirmed
+                handle = fake._handle
+
+                def disconnect_after_apply(text):
+                    handle(text)
+                    if text == "yes" or (text.startswith("commit label ") and not confirmed):
+                        fake.connected = False
+                        fake.chunks.clear()
+
+                fake._handle = disconnect_after_apply
+                manager, session = self.ready_commit(fake)
+                label = await manager._commit_and_verify(session, "disconnected")
+                self.assertEqual(label, fake.history_label)
+                self.assertEqual(fake.reconnect_count, 1)
+                self.assertEqual(fake.writes.count("yes"), int(confirmed))
+                self.assertEqual(sum(item.startswith("commit label ") for item in fake.writes), 1)
+                self.assertEqual(len(fake.committed_targets), 1)
+
+    async def test_failed_commit_recovery_never_queries_history(self):
+        fake = FakeCiscoTelnet()
+        fake.commit_lost_at = 1
+        manager, session = self.ready_commit(fake)
+        session.restore = AsyncMock(side_effect=TimeoutError("recovery stuck"))
+        with self.assertRaisesRegex(cisco.CiscoResultUnconfirmed, "recovery failed"):
+            await manager._commit_and_verify(session, "recovery-failed")
+        self.assert_commit_stopped(fake)
+
+    async def test_known_failure_before_confirmation_does_not_send_yes(self):
+        fake = FakeCiscoTelnet()
+        fake.confirm_commit = True
+        handle = fake._handle
+
+        def rejected(text):
+            handle(text)
+            if text.startswith("commit label "):
+                fake.chunks.insert(-1, "% Failed to commit one or more configuration items\r\n")
+
+        fake._handle = rejected
+        manager, session = self.ready_commit(fake)
+        with self.assertRaises(cisco.CiscoCommandError):
+            await manager._commit_and_verify(session, "before-confirmation")
+        self.assert_commit_stopped(fake)
+
+    async def test_history_finds_twentieth_record(self):
+        fake = FakeCiscoTelnet()
+        fake.extra_history_labels = [f"commit-{index}" for index in range(19)]
+        manager, session = self.ready_commit(fake)
+        self.assertEqual(await manager._commit_and_verify(session, "twentieth"), fake.history_label)
+
+    async def test_history_keeps_retrying_after_more_than_two_old_records(self):
+        fake = FakeCiscoTelnet()
+        fake.history_override = "old-record"
+        fake.history_override_queries = 3
+        manager, session = self.ready_commit(fake)
+        manager.COMMIT_HISTORY_MAX_ATTEMPTS = 4
+        await manager._commit_and_verify(session, "delayed-history")
+        self.assertEqual(fake.writes.count("do show configuration commit list 20"), 4)
+        self.assertEqual(len(fake.committed_targets), 1)
+
+    async def test_history_does_not_accept_a_label_prefix(self):
+        fake = FakeCiscoTelnet()
+        fake.history_label = "expected-suffix"
+        manager, session = self.ready_commit(fake)
+        self.assertIsNone(await manager._verify_commit_history(session, "expected"))
+
+    async def test_history_records_empty_and_malformed_output_reasons(self):
+        for output, reason in (("", "history empty"), ("unexpected layout\r\n", "history unparseable")):
+            with self.subTest(output=output):
+                fake = FakeCiscoTelnet()
+                fake.history_output = output
+                manager, session = self.ready_commit(fake)
+                with self.assertLogs(cisco.log, level="WARNING") as logs:
+                    with self.assertRaises(cisco.CiscoResultUnconfirmed) as caught:
+                        await manager._commit_and_verify(session, "bad-history")
+                self.assertIn(reason, "\n".join(logs.output))
+                self.assertIn("after 3 queries", str(caught.exception))
+                self.assertEqual(len(fake.committed_targets), 1)
+
     async def test_reload_when_session_is_lost_before_final_commit(self):
         fake = FakeCiscoTelnet()
         manager = make_manager(fake)
@@ -499,14 +750,14 @@ class CiscoImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ipv4 address 10.0.0.2 255.255.255.0", commands)
         self.assertIn("no shutdown", commands)
         self.assertIn("load ftp://ftpuser:ftppass@10.0.0.1/node-1.cfg", commands)
-        self.assertIn("do show configuration commit list", commands)
+        self.assertIn("do show configuration commit list 20", commands)
         commit_commands = [item for item in commands if item.startswith("commit label ")]
         self.assertEqual(len(commit_commands), 2)
         self.assertIn(fake.history_label, commit_commands[-1])
         self.assertIn(" replace", commit_commands[-1])
         self.assertNotIn(" replace", commit_commands[0])
-        self.assertLessEqual(len(fake.history_label), 20)
-        self.assertTrue(fake.history_label.startswith("ci-"))
+        self.assertRegex(fake.history_label, r"^c[a-z2-7]{9}$")
+        self.assertTrue(all(ending == b"\r" for ending in fake.line_endings))
         self.assertEqual(STATE["emulation"].deleted, [("project-1", "ftp-node")])
         self.assertTrue(fake.closed)
         self.assertIn(("loopback_last_adapter_for_uni",), manager.parent_calls)
@@ -529,17 +780,17 @@ class CiscoImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         await manager.import_cfg("/tmp/cisco.cfg")
 
         self.assertEqual(
-            fake.writes.count("do show configuration commit list"),
+            fake.writes.count("do show configuration commit list 20"),
             3,
         )
 
     async def test_commit_label_mismatch_fails(self):
         fake = FakeCiscoTelnet()
         fake.history_override = "other-label"
-        fake.history_override_queries = 2
+        fake.history_override_queries = -1
         manager = make_manager(fake)
 
-        with self.assertRaises(cisco.CiscoCommitVerificationError):
+        with self.assertRaises(cisco.CiscoResultUnconfirmed):
             await manager.import_cfg("/tmp/cisco.cfg")
 
         self.assertTrue(fake.closed)
@@ -651,7 +902,7 @@ class CiscoImportScenarioTest(unittest.IsolatedAsyncioTestCase):
                 cancellations.append(True)
 
         def hang_on_history(command):
-            if command == "do show configuration commit list":
+            if command == "do show configuration commit list 20":
                 fake.read_available = AsyncMock(side_effect=hang)
             else:
                 handle(command)
@@ -700,7 +951,7 @@ class CiscoImportScenarioTest(unittest.IsolatedAsyncioTestCase):
                     await asyncio.Event().wait()
                 finally:
                     cancelled.set()
-            return "expected"
+            return ("expected",)
 
         with patch.object(manager, "_run_history_query", new=AsyncMock(side_effect=query)) as queried:
             verified = await manager._verify_commit_history(None, "expected")
@@ -729,7 +980,7 @@ class CiscoImportScenarioTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_history_query_error_fails_fast(self):
         fake = FakeCiscoTelnet()
-        fake.command_errors["do show configuration commit list"] = "% Invalid input"
+        fake.command_errors["do show configuration commit list 20"] = "% Invalid input"
         manager = make_manager(fake)
         session = manager._console_session(fake)
 
@@ -775,7 +1026,7 @@ class CiscoImportScenarioTest(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(commit_commands), 1)
         self.assertNotIn(" replace", commit_commands[0])
-        self.assertIn("do show configuration commit list", fake.writes)
+        self.assertIn("do show configuration commit list 20", fake.writes)
 
 
 if __name__ == "__main__":

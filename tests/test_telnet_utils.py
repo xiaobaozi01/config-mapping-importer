@@ -84,6 +84,12 @@ class TelnetClientTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(socket.writes, [b"cmd\r\n", b"cmd\n", b"\r"])
 
+    async def test_cisco_command_and_confirmation_send_one_enter_each(self):
+        client, socket = self.make_client()
+        await client.write_line("commit label cabcdef234 replace", b"\r")
+        await client.write_line("yes", b"\r")
+        self.assertEqual(socket.writes, [b"commit label cabcdef234 replace\r", b"yes\r"])
+
     async def test_write_line_does_not_sleep(self):
         """验证原始 write_line 不包含等待。"""
         client, socket = self.make_client()

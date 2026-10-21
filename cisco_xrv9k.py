@@ -9,6 +9,7 @@ console 交互已经下沉到通用 ConsoleSession，本模块只保留 Cisco �
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import re
 import uuid
@@ -61,8 +62,7 @@ CISCO_PROMPTS: tuple[PromptRule, ...] = (
     PromptRule(PromptName.SECRET, re.compile(r"(?im)^Enter secret(?: again)?:[ \t]*$")),
     PromptRule(PromptName.USERNAME, re.compile(r"(?im)^Username:[ \t]*$")),
     PromptRule(PromptName.PASSWORD, re.compile(r"(?im)^Password:[ \t]*$")),
-    # 不要用通用 [yes/no] 猜测未知交互，避免把普通输出当确认。
-    PromptRule(PromptName.CONFIRM, re.compile(r"(?im)^Do you wish to proceed[^\r\n]*\?(?:[ \t]*\[no\]:)?[ \t]*$")),
+    PromptRule(PromptName.CONFIRM, re.compile(r"^Do you wish to proceed\? \[no\]:$")),
 )
 
 # 命令都是确定的，正常情况下不应出现；保留用于防御。
@@ -88,8 +88,8 @@ CISCO_COMMIT_ERROR_PATTERNS = CISCO_CLI_ERROR_PATTERNS + (
 
 # 实际日志可能带时间戳和进程前缀，不能锚定行首的 %。
 CISCO_BACKGROUND_PATTERN = re.compile(r"(?i)%[A-Z0-9_]+(?:-[A-Z0-9_]+)*-\d+-[A-Z0-9_]+")
-# commit label 会替代自动 ID 显示在最新一行。
-CISCO_COMMIT_ROW_PATTERN = re.compile(r"(?m)^\s*1\s+(\S+)\s+")
+# 仅匹配列表记录，避免跨行空白误吞下一条输出。
+CISCO_COMMIT_ROW_PATTERN = re.compile(r"(?m)^[ \t]*(?:[1-9]|1[0-9]|20)[ \t]+(\S+)[ \t]+\S+")
 
 
 def build_cisco_console_profile(username: str, password: str) -> ConsoleProfile:
@@ -110,7 +110,7 @@ def build_cisco_console_profile(username: str, password: str) -> ConsoleProfile:
             ModeStep(PromptName.EXEC, "configure"),
         ),
         command_prompt=PromptName.CONFIG,
-        line_ending=b"\r\n",
+        line_ending=b"\r",
         error_patterns=CISCO_CLI_ERROR_PATTERNS,
         background_patterns=(CISCO_BACKGROUND_PATTERN,),
     )
@@ -166,11 +166,11 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
 
     # commit 历史可能短暂滞后，不能只查询一次就判失败。
     COMMIT_HISTORY_RETRY_INTERVAL = 5
-    COMMIT_HISTORY_MISMATCH_LIMIT = 2
+    COMMIT_EXCHANGE_TIMEOUT = 300
 
-    # XR 的 commit label 最长 20 个字符，无法直接使用完整 UUID。
-    COMMIT_LABEL_PREFIX = "ci-"
-    COMMIT_LABEL_UUID_CHARS = 16
+    # 10 位内完整匹配，避免依赖普通历史列表的长 label 显示宽度。
+    COMMIT_LABEL_PREFIX = "c"
+    COMMIT_LABEL_RANDOM_CHARS = 9
 
     # 测试和现场可能需要调整等待节奏。
     READ_INTERVAL = 0.2
@@ -350,97 +350,97 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
         replace: bool = True,
         loaded_generation: int | None = None,
     ) -> str:
-        """用带 label 的 commit 提交配置并核实。
-
-        只有最新 label 与本次 UUID 一致，才能证明本次提交成功。
-        """
-        label = f"{self.COMMIT_LABEL_PREFIX}{uuid.uuid4().hex[:self.COMMIT_LABEL_UUID_CHARS]}"
+        """发送提交、回答一次确认，交互结束或恢复后核实提交历史。"""
+        random_part = base64.b32encode(uuid.uuid4().bytes).decode("ascii").lower()
+        label = self.COMMIT_LABEL_PREFIX + random_part[:self.COMMIT_LABEL_RANDOM_CHARS]
         command = f"commit label {label}" + (" replace" if replace else "")
-        log.info("Cisco commit start: node=%s stage=%s label=%s", self._node_id, stage, label)
-        commit_error: CiscoResultUnconfirmed | None = None
-        try:
-            await self._run_command(
-                session,
-                command,
-                patterns=CISCO_COMMIT_ERROR_PATTERNS,
-                allow_confirm=True,
-                expected_generation=loaded_generation,
-            )
-        except CiscoCandidateLost:
-            raise
-        except CiscoResultUnconfirmed as exc:
-            commit_error = exc
-            log.warning("Cisco commit result lost; checking history: node=%s label=%s", self._node_id, label)
 
-        verified = await self._verify_commit_history(session, label)
-        if verified is True:
-            log.info("Cisco XRv9k commit verified: node=%s label=%s", self._node_id, label)
-            return label
-        if verified is False:
-            if commit_error is not None:
-                raise commit_error
-            raise CiscoCommitVerificationError(
-                f"{self._node_id} latest Cisco commit label does not match "
-                f"{label!r} ({stage})"
+        await session.ensure_ready()
+        if loaded_generation is not None and loaded_generation != session.recovery_generation:
+            raise CiscoCandidateLost(f"{self._node_id} Cisco configuration session changed")
+        log.info("Cisco commit start: node=%s stage=%s label=%s", self._node_id, stage, label)
+
+        result = await self._exchange_commit(session, command, stage)
+        if result.prompt_returned and result.prompt_name == PromptName.CONFIRM:
+            log.info("Cisco commit confirmation: node=%s stage=%s label=%s action=yes", self._node_id, stage, label)
+            before_confirmation = result.output
+            result = await self._exchange_commit(session, "yes", stage)
+            result.output = before_confirmation + "\n" + result.output
+
+        if result.restore_required:
+            log.warning("Cisco commit session lost: node=%s stage=%s label=%s output=%r",
+                        self._node_id, stage, label, self._tail(result.output))
+            try:
+                await session.restore(result.output)
+            except (ConnectionError, TimeoutError, RuntimeError) as exc:
+                raise CiscoResultUnconfirmed(f"{self._node_id} commit recovery failed ({stage}, {label}): {exc}") from exc
+
+        if not await self._verify_commit_history(session, label):
+            raise CiscoResultUnconfirmed(
+                f"{self._node_id} commit result unconfirmed (结果未确认): stage={stage} label={label} "
+                f"after {self.COMMIT_HISTORY_MAX_ATTEMPTS} queries"
             )
-        if commit_error is not None:
-            raise commit_error
+        log.info("Cisco XRv9k commit verified: node=%s stage=%s label=%s", self._node_id, stage, label)
+        return label
+
+    async def _exchange_commit(self, session: ConsoleSession, command: str, stage: str) -> ConsoleResult:
+        """一次有界提交交互；不发送空回车，不自动处理未知或重复确认。"""
+        result = await session.exchange(
+            command, timeout=self.COMMIT_EXCHANGE_TIMEOUT, idle_probe=False,
+            prompt_names={PromptName.CONFIG, PromptName.CONFIRM},
+            failure_patterns=CISCO_COMMIT_ERROR_PATTERNS,
+        )
+        self._raise_command_error(session, result, command, CISCO_COMMIT_ERROR_PATTERNS)
+        if command == "yes" and result.prompt_name == PromptName.CONFIRM:
+            reason = "repeated confirmation after yes"
+        elif result.timed_out or (not result.prompt_returned and not result.restore_required):
+            reason = "commit interaction timed out or did not return a prompt"
+        else:
+            return result
+        log.warning("Cisco commit interaction failed: stage=%s command=%r reason=%s output=%r",
+                    stage, command, reason, self._tail(result.output))
         raise CiscoResultUnconfirmed(
-            f"{self._node_id} Cisco commit result could not be verified ({stage}); "
-            "result unconfirmed (结果未确认)"
+            f"{self._node_id} {reason}: stage={stage} command={command!r}\n{self._tail(result.output)}"
         )
 
     async def _verify_commit_history(self, session: ConsoleSession, label: str) -> bool | None:
-        """循环核实最新提交记录。
-
-        提交历史可能短暂滞后，单次查询会把成功误判为未确认。
-        """
-        mismatches = 0
+        """在最近记录中完整匹配；旧记录不消耗额外的失败阈值。"""
         for attempt in range(self.COMMIT_HISTORY_MAX_ATTEMPTS):
             try:
-                latest = await asyncio.wait_for(
+                labels = await asyncio.wait_for(
                     self._run_history_query(session), timeout=self.COMMIT_HISTORY_QUERY_TIMEOUT,
                 )
             except TimeoutError:
-                latest = None
-                log.warning("Cisco commit history query timed out: node=%s attempt=%s", self._node_id, attempt + 1)
-            if latest == label:
+                labels = None
+                log.warning("Cisco commit history query timed out: node=%s label=%s attempt=%s",
+                            self._node_id, label, attempt + 1)
+            if labels is not None and label in labels:
                 return True
-            if latest is not None:
-                mismatches += 1
-                log.warning(
-                    "Latest Cisco commit label mismatch: node=%s expected=%r actual=%r",
-                    self._node_id,
-                    label,
-                    latest,
-                )
-                if mismatches >= self.COMMIT_HISTORY_MISMATCH_LIMIT:
-                    return False
+            log.warning("Cisco commit history pending: node=%s label=%s attempt=%s records=%r",
+                        self._node_id, label, attempt + 1, labels)
             if attempt + 1 < self.COMMIT_HISTORY_MAX_ATTEMPTS:
                 await asyncio.sleep(self.COMMIT_HISTORY_RETRY_INTERVAL)
-        log.warning("Cisco commit history verification unconfirmed: node=%s label=%s", self._node_id, label)
         return None
 
-    async def _run_history_query(self, session: ConsoleSession) -> str | None:
-        """执行一次提交历史查询。
-
-        查询失败或暂无记录应返回 None，由外层决定是否重试。
-        """
-        command = "do show configuration commit list"
+    async def _run_history_query(self, session: ConsoleSession) -> tuple[str, ...] | None:
+        """读取最近 20 条记录；查询或解析失败时保留原始输出。"""
+        command = "do show configuration commit list 20"
         try:
             result = await self._run_command(session, command)
         except CiscoCommandError as exc:
-            raise CiscoResultUnconfirmed(f"{self._node_id} Cisco commit history query failed: {exc}") from exc
-        except CiscoResultUnconfirmed:
-            return None
-        except (ConnectionError, TimeoutError, RuntimeError) as exc:
+            raise CiscoResultUnconfirmed(f"{self._node_id} Cisco commit history command rejected: {exc}") from exc
+        except (CiscoResultUnconfirmed, ConnectionError, TimeoutError, RuntimeError) as exc:
             log.warning("Cisco commit history query failed: node=%s detail=%s", self._node_id, exc)
             return None
         text = session.analysis_text(result.output, command)
-        match = CISCO_COMMIT_ROW_PATTERN.search(text)
-        if match is None:
-            return None
-        return match.group(1)
+        labels = tuple(CISCO_COMMIT_ROW_PATTERN.findall(text))
+        if labels:
+            return labels
+        lines = (line.strip() for line in text.splitlines() if line.strip())
+        empty = all(re.fullmatch(r"SNo\.[ \t]+Label/ID[^\r\n]*|[~ \t-]+", line) for line in lines)
+        log.warning("Cisco commit history %s: node=%s output=%r",
+                    "empty" if empty else "unparseable", self._node_id, self._tail(result.output))
+        return None
 
     async def _run_command(
         self,
@@ -448,7 +448,6 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
         command: str,
         patterns: tuple[re.Pattern[str], ...] = CISCO_CLI_ERROR_PATTERNS,
         prompt_names: tuple[PromptName, ...] = (PromptName.CONFIG,),
-        allow_confirm: bool = False,
         expected_generation: int | None = None,
     ) -> ConsoleResult:
         """执行一条命令并检查阶段结果。
@@ -459,14 +458,7 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
         if expected_generation is not None and expected_generation != session.recovery_generation:
             raise CiscoCandidateLost(f"{self._node_id} Cisco configuration session changed")
         expected_prompts = set(prompt_names)
-        if allow_confirm:
-            expected_prompts.add(PromptName.CONFIRM)
         result = await session.exchange(command, prompt_names=expected_prompts)
-        if allow_confirm and result.prompt_name == PromptName.CONFIRM:
-            before_confirmation = result
-            result = await session.exchange("yes", prompt_names={PromptName.CONFIG})
-            result.output = before_confirmation.output + "\n" + result.output
-            result.sent = before_confirmation.sent or result.sent
         self._check_result(session, result, command, patterns)
         return result
 
@@ -481,21 +473,28 @@ class CiscoIOSXRV9kd7d11d1ConfigManager(NeConfigManager):
 
         不同阶段只应检查自己的错误，不能混用 load/commit 模式。
         """
+        self._raise_command_error(session, result, command, patterns)
         if result.restore_required or result.disconnected:
             raise CiscoResultUnconfirmed(
-                f"{self._node_id} Cisco session lost during {command!r}; "
+                f"{self._node_id} Cisco session lost during {self._tail(command)!r}; "
                 "result unconfirmed (结果未确认)"
             )
         if not result.prompt_returned:
             raise CiscoResultUnconfirmed(
-                f"{self._node_id} Cisco command did not return a prompt: {command!r}\n"
+                f"{self._node_id} Cisco command did not return a prompt: {self._tail(command)!r}\n"
                 f"{self._tail(result.output)}"
             )
+
+    def _raise_command_error(
+        self, session: ConsoleSession, result: ConsoleResult, command: str,
+        patterns: tuple[re.Pattern[str], ...],
+    ) -> None:
+        """即使提示符未返回，也优先报告设备明确拒绝命令的原因。"""
         text = session.analysis_text(result.output, command)
         error = session.find_explicit_error(text, patterns=patterns)
         if error:
             raise CiscoCommandError(
-                f"{self._node_id} Cisco command failed ({command}): {error}\n"
+                f"{self._node_id} Cisco command failed ({self._tail(command)}): {self._tail(error)}\n"
                 f"{self._tail(result.output)}"
             )
 
